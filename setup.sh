@@ -126,8 +126,13 @@ if conda env list | grep -qw "$ENV_NAME"; then
 else
     warn "Environment '$ENV_NAME' not found — creating from $ENV_YML ..."
     info "This may take a few minutes (downloading PyTorch + CUDA)."
-    "$CONDA_BIN" env create -f "$ENV_YML" 2>&1 | tail -5
-    ok "Environment '$ENV_NAME' created"
+    if "$CONDA_BIN" env create -f "$ENV_YML"; then
+        ok "Environment '$ENV_NAME' created"
+    else
+        fail "conda env create failed. Check output above."
+        fail "Hint: try manually: $CONDA_BIN env create -f $ENV_YML"
+        exit 1
+    fi
 fi
 
 conda activate "$ENV_NAME"
