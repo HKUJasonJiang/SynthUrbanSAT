@@ -63,7 +63,7 @@ NUM_FOURIER_BANDS=32
 BOUNDARY_THRESHOLD=0.1
 
 # ── Training ─────────────────────────────────────────────────────────────────
-NUM_EPOCHS=100
+NUM_EPOCHS=500
 BATCH_SIZE=4
 ADAPTER_LR=3e-4                  # HDC²A adapter learning rate
 BACKBONE_LR=0.0                  # ControlNet backbone LR (0 = frozen)
@@ -73,7 +73,7 @@ MAX_GRAD_NORM=1.0
 GRAD_ACCUM_STEPS=4               # effective_bs = BATCH_SIZE × GRAD_ACCUM_STEPS
 GUIDANCE_SCALE=3.5
 NUM_WORKERS=0
-SEED=""                          # empty = no seed; set e.g. 42 for reproducibility
+SEED=42                         # empty = no seed; set e.g. 42 for reproducibility
 
 # ── Text ─────────────────────────────────────────────────────────────────────
 TEXT_SEQ_LEN=512

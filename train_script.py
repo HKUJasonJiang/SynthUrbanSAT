@@ -763,12 +763,20 @@ def main():
 
     # ── Resume ──────────────────────────────────────────────────────────────
     start_epoch = 0
+    _resume_global_step = 0
+    _resume_best_val_loss = float('inf')
     if config['resume_from'] is not None:
         phase('[6/8] Resuming from Checkpoint', config)
         print(f'  Path: {config["resume_from"]}')
-        start_epoch = load_checkpoint(
-            config['resume_from'], hdc2a, transformer, optimizer, device) + 1
-        print(f'  Resuming from epoch {start_epoch}')
+        _ckpt_info = load_checkpoint(
+            config['resume_from'], hdc2a, transformer, optimizer, device,
+            scheduler=scheduler)
+        start_epoch = _ckpt_info['epoch'] + 1
+        _resume_global_step = _ckpt_info.get('global_step', 0)
+        _resume_best_val_loss = _ckpt_info.get('best_val_loss', float('inf'))
+        print(f'  Resuming from epoch {start_epoch}, '
+              f'global_step={_resume_global_step}, '
+              f'best_val_loss={_resume_best_val_loss:.6f}')
     else:
         print('  [6/8] Resume: skipped (no checkpoint specified)')
 
@@ -837,7 +845,7 @@ def main():
             wandb.finish()
             return
         print('\n*** --test-data: running 1 training step... ***')
-        train_loss = train_one_epoch(
+        train_loss, _ = train_one_epoch(
             0, hdc2a, transformer, vae, bn_mean, bn_std,
             train_loader, optimizer, None, config, scheduler=scheduler,
         )
@@ -856,11 +864,12 @@ def main():
           f'weight_decay={config["weight_decay"]}')
     print(f'{bold("="*70)}')
 
-    best_val_loss = float('inf')
+    best_val_loss = _resume_best_val_loss
     best_ckpt_path = None
     keep_last_n = config.get('keep_last_n_checkpoints', 3)
     train_start_time = time.time()
     _train_losses = []   # for loss-curve PNG
+    _cumulative_opt_steps = _resume_global_step  # tracks optimizer steps across epochs
 
     # === OVERFIT TEST ===
     _overfit_mode = config.get('_overfit_mode', False)
@@ -1002,7 +1011,7 @@ def main():
 
         # Train
         print(f'\n--- {bold_magenta(f"Epoch {epoch}/{total_epochs-1}")}  ({bold_cyan(f"{epoch_progress:.0f}%")} done) ---')
-        train_loss = train_one_epoch(
+        train_loss, _epoch_opt_steps = train_one_epoch(
             epoch, hdc2a, transformer, vae, bn_mean, bn_std,
             train_loader, optimizer, None, config, scheduler=scheduler,
             step_vis_callback=_active_step_vis_callback,
@@ -1012,6 +1021,7 @@ def main():
         elapsed = time.time() - train_start_time
         epochs_done = epoch - start_epoch + 1
         eta = elapsed / epochs_done * (total_epochs - start_epoch - epochs_done)
+        _cumulative_opt_steps += _epoch_opt_steps
         print(f'  Train loss: {yellow(f"{train_loss:.6f}")} ({epoch_time:.1f}s)  '
               f'ETA: {cyan(f"{eta/60:.0f}min")}')
         _train_losses.append((epoch, train_loss))
@@ -1041,6 +1051,8 @@ def main():
                 keep_last_n=keep_last_n,
                 best_loss=best_val_loss,
                 best_ckpt_path=best_ckpt_path,
+                scheduler=scheduler,
+                global_step=_cumulative_opt_steps,
             )
 
         # Periodic checkpoint (even when no val this epoch)
@@ -1058,6 +1070,8 @@ def main():
                     keep_last_n=keep_last_n,
                     best_loss=best_val_loss,
                     best_ckpt_path=best_ckpt_path,
+                    scheduler=scheduler,
+                    global_step=_cumulative_opt_steps,
                 )
 
         check_memory(f'epoch {epoch} end')
