@@ -85,7 +85,7 @@ SAVE_EVERY_N_EPOCHS=5
 VAL_EVERY_N_EPOCHS=1
 
 # ── WandB ────────────────────────────────────────────────────────────────────
-WANDB_ENTITY="hku-xgboost"
+WANDB_ENTITY=""                 # empty = personal namespace of the logged-in user (safest default)
 WANDB_PROJECT=""                 # empty = use NAME as project
 
 # ── Resume ───────────────────────────────────────────────────────────────────
@@ -129,8 +129,10 @@ CMD=(
     --log-interval "$LOG_INTERVAL"
     --save-every-n-epochs "$SAVE_EVERY_N_EPOCHS"
     --val-every-n-epochs "$VAL_EVERY_N_EPOCHS"
-    --wandb-entity "$WANDB_ENTITY"
 )
+
+# Only pass --wandb-entity if non-empty (empty = use logged-in user's personal namespace)
+[[ -n "$WANDB_ENTITY" ]] && CMD+=(--wandb-entity "$WANDB_ENTITY")
 
 # Backbone LR (only pass when > 0, which also implies unfreeze)
 if [[ "$FREEZE_BACKBONE" == "true" ]]; then

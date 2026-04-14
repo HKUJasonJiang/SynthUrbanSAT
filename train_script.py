@@ -168,7 +168,7 @@ CONFIG = {
     'val_every_n_epochs': 1,
 
     # ── WandB ──
-    'wandb_entity': 'hku-xgboost',
+    'wandb_entity': '',              # empty = personal namespace of logged-in user
     'wandb_project': '<plz rewrite project name> via --name',        # can modify per run via --name
 
     # ── Resume ──
@@ -563,17 +563,21 @@ def main():
     mode = 'test' if (args.test or args.test_data) else 'train'
     _run_label = args.name if args.name else 'hdc2a'
     try:
-        run = wandb.init(
-            entity=config['wandb_entity'],
+        _wandb_kwargs = dict(
             project=config['wandb_project'],
             name=f'{_run_label}-{mode}-{time.strftime("%Y%m%d-%H%M%S")}',
             config={k: str(v) for k, v in config.items()},
             tags=[mode],
             settings=wandb.Settings(
-                console='off',           # 'wrap' probes terminal with OSC11/DA1 queries → garbage in piped output
-                x_disable_stats=True,    # disable built-in 21 system metrics
+                console='off',
+                x_disable_stats=True,
             ),
         )
+        # Only set entity when explicitly configured — empty means personal namespace
+        _wandb_entity = config.get('wandb_entity', '')
+        if _wandb_entity:
+            _wandb_kwargs['entity'] = _wandb_entity
+        run = wandb.init(**_wandb_kwargs)
         config['_wandb_active'] = True
     except Exception as _wandb_err:
         print(f'\n{bold_yellow("WARNING: WandB init failed — training will continue without logging.")}')
