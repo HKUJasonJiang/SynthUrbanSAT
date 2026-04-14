@@ -29,6 +29,7 @@ dependencies:
     - numpy
     - Pillow
     - einops
+    - tifffile
     # ── Training ──
     - wandb
     - psutil

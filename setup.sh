@@ -273,7 +273,7 @@ else
     echo ""
 
     # Force colors in piped output
-    if "$PYTHON" -u train_script.py --test --no-wandb 2>&1 | tee "$TEST_LOG"; then
+    if "$PYTHON" -u train_script.py --test --no-wandb --name _smoke_test 2>&1 | tee "$TEST_LOG"; then
         echo ""
         ok "Smoke test PASSED"
         ok "Log: $TEST_LOG"
