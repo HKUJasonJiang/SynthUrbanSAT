@@ -231,14 +231,39 @@ else
     CHECKS_PASSED=false
 fi
 
-# Key packages
-for pkg in diffusers transformers accelerate safetensors wandb einops psutil sentencepiece; do
-    if "$PYTHON" -c "import $pkg" 2>/dev/null; then
-        VER=$("$PYTHON" -c "import $pkg; print(getattr($pkg, '__version__', 'ok'))" 2>/dev/null)
-        ok "$pkg=$VER"
+# Key packages (import_name:pip_package)
+REQUIRED_PY_PKGS=(
+    "diffusers:diffusers"
+    "transformers:transformers"
+    "accelerate:accelerate"
+    "safetensors:safetensors"
+    "wandb:wandb"
+    "einops:einops"
+    "psutil:psutil"
+    "sentencepiece:sentencepiece"
+    "tifffile:tifffile"
+)
+
+for spec in "${REQUIRED_PY_PKGS[@]}"; do
+    mod_name="${spec%%:*}"
+    pip_name="${spec##*:}"
+    if "$PYTHON" -c "import ${mod_name}" 2>/dev/null; then
+        VER=$("$PYTHON" -c "import ${mod_name}; print(getattr(${mod_name}, '__version__', 'ok'))" 2>/dev/null)
+        ok "${mod_name}=${VER}"
     else
-        fail "$pkg not installed"
-        CHECKS_PASSED=false
+        warn "${mod_name} not installed — trying: pip install ${pip_name}"
+        if "$PYTHON" -m pip install -q "${pip_name}"; then
+            if "$PYTHON" -c "import ${mod_name}" 2>/dev/null; then
+                VER=$("$PYTHON" -c "import ${mod_name}; print(getattr(${mod_name}, '__version__', 'ok'))" 2>/dev/null)
+                ok "${mod_name}=${VER} (installed now)"
+            else
+                fail "${mod_name} install completed but import still fails"
+                CHECKS_PASSED=false
+            fi
+        else
+            fail "${mod_name} install failed"
+            CHECKS_PASSED=false
+        fi
     fi
 done
 
