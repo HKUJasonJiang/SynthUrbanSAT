@@ -562,18 +562,26 @@ def main():
     # ── WandB init ──────────────────────────────────────────────────────────
     mode = 'test' if (args.test or args.test_data) else 'train'
     _run_label = args.name if args.name else 'hdc2a'
-    run = wandb.init(
-        entity=config['wandb_entity'],
-        project=config['wandb_project'],
-        name=f'{_run_label}-{mode}-{time.strftime("%Y%m%d-%H%M%S")}',
-        config={k: str(v) for k, v in config.items()},
-        tags=[mode],
-        settings=wandb.Settings(
-            console='off',           # 'wrap' probes terminal with OSC11/DA1 queries → garbage in piped output
-            x_disable_stats=True,    # disable built-in 21 system metrics
-        ),
-    )
-    config['_wandb_active'] = True
+    try:
+        run = wandb.init(
+            entity=config['wandb_entity'],
+            project=config['wandb_project'],
+            name=f'{_run_label}-{mode}-{time.strftime("%Y%m%d-%H%M%S")}',
+            config={k: str(v) for k, v in config.items()},
+            tags=[mode],
+            settings=wandb.Settings(
+                console='off',           # 'wrap' probes terminal with OSC11/DA1 queries → garbage in piped output
+                x_disable_stats=True,    # disable built-in 21 system metrics
+            ),
+        )
+        config['_wandb_active'] = True
+    except Exception as _wandb_err:
+        print(f'\n{bold_yellow("WARNING: WandB init failed — training will continue without logging.")}')
+        print(f'  Error: {_wandb_err}')
+        print(f'  Fix: check WANDB_API_KEY permissions, or run with --no-wandb to silence this.\n')
+        os.environ['WANDB_MODE'] = 'disabled'
+        wandb.init(mode='disabled')
+        config['_wandb_active'] = False
 
     # ── Print final resolved config ────────────────────────────────────────
     print(f'\n{bold_cyan("Final Configuration:")}')
