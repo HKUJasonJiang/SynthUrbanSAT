@@ -23,10 +23,14 @@ wandb/
 # OS
 .DS_Store
 
+# Secrets
+.env
+
 # Upload script (one-time use)
 _upload_hf.py
 
 # Logs
 nohup.out
+*.log
 *.log
 _upload_remaining.py

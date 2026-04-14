@@ -10,10 +10,13 @@
 #   5. Verify all dependencies
 #   6. Run smoke test
 #
+# Tokens:
+#   Create a .env file (see .env.example) with HF_TOKEN_READ and HF_TOKEN_WRITE.
+#   Alternatively, pass via environment:  HF_TOKEN_READ=hf_xxx bash setup.sh
+#
 # Usage:
 #   bash setup.sh                          # full setup + test
 #   bash setup.sh --skip-test              # skip smoke test
-#   bash setup.sh --hf-token <TOKEN>       # override HF token
 #
 # After this passes, run training with:
 #   bash run_train.sh
@@ -30,10 +33,18 @@ CONDA_BIN="$CONDA_BASE/bin/conda"
 ENV_YML="environment.yml"
 LOG_DIR="output"
 
+# Load .env if present (tokens, overrides)
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+
 # HuggingFace repos
 HF_DATASET_REPO="JasonXF/US3D-Enhanced"
 HF_MODEL_REPO="JasonXF/SynthUrbanSAT"
-HF_TOKEN="${HF_TOKEN:-}"
+HF_TOKEN_READ="${HF_TOKEN_READ:-}"
+HF_TOKEN_WRITE="${HF_TOKEN_WRITE:-}"
 
 # Miniconda installer URL
 MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
@@ -59,19 +70,24 @@ SKIP_TEST=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-test)  SKIP_TEST=true; shift ;;
-        --hf-token)   HF_TOKEN="$2"; shift 2 ;;
         *)            shift ;;
     esac
 done
 
 mkdir -p "$LOG_DIR"
 
-# Check HF token
-if [[ -z "$HF_TOKEN" ]]; then
-    fail "HuggingFace token required for downloading dataset & weights."
-    fail "Usage:  HF_TOKEN=hf_xxxxx bash setup.sh"
-    fail "   or:  bash setup.sh --hf-token hf_xxxxx"
+# Check HF read token
+if [[ -z "$HF_TOKEN_READ" ]]; then
+    fail "HF_TOKEN_READ is required for downloading dataset & weights."
+    fail "Create a .env file with:  HF_TOKEN_READ=hf_xxxxx"
+    fail "Or run:  HF_TOKEN_READ=hf_xxxxx bash setup.sh"
     exit 1
+fi
+
+if [[ -n "$HF_TOKEN_WRITE" ]]; then
+    ok "HF_TOKEN_WRITE found — results can be pushed to HuggingFace"
+else
+    warn "HF_TOKEN_WRITE not set — you won't be able to push results to HF"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -151,7 +167,7 @@ snapshot_download(
     repo_id='${HF_DATASET_REPO}',
     repo_type='dataset',
     local_dir='${DATASET_DIR}',
-    token='${HF_TOKEN}',
+    token='${HF_TOKEN_READ}',
 )
 print('Download complete.')
 "
@@ -176,7 +192,7 @@ snapshot_download(
     repo_id='${HF_MODEL_REPO}',
     repo_type='model',
     local_dir='${WEIGHTS_DIR}',
-    token='${HF_TOKEN}',
+    token='${HF_TOKEN_READ}',
 )
 print('Download complete.')
 "
