@@ -763,21 +763,12 @@ def main():
 
     # ── Resume ──────────────────────────────────────────────────────────────
     start_epoch = 0
-    _resumed_best_val_loss = float('inf')
-    _resumed_global_step = 0
     if config['resume_from'] is not None:
         phase('[6/8] Resuming from Checkpoint', config)
         print(f'  Path: {config["resume_from"]}')
-        _ckpt_info = load_checkpoint(
-            config['resume_from'], hdc2a, transformer, optimizer, device,
-            scheduler=scheduler)
-        start_epoch = _ckpt_info['epoch'] + 1
-        _resumed_best_val_loss = _ckpt_info.get('best_val_loss', float('inf'))
-        _resumed_global_step = _ckpt_info.get('global_step', 0)
+        start_epoch = load_checkpoint(
+            config['resume_from'], hdc2a, transformer, optimizer, device) + 1
         print(f'  Resuming from epoch {start_epoch}')
-        # Print current LR after scheduler restore
-        _cur_lrs = [pg['lr'] for pg in optimizer.param_groups]
-        print(f'  Restored LR(s): {["{:.2e}".format(lr) for lr in _cur_lrs]}')
     else:
         print('  [6/8] Resume: skipped (no checkpoint specified)')
 
@@ -846,7 +837,7 @@ def main():
             wandb.finish()
             return
         print('\n*** --test-data: running 1 training step... ***')
-        train_loss, _ = train_one_epoch(
+        train_loss = train_one_epoch(
             0, hdc2a, transformer, vae, bn_mean, bn_std,
             train_loader, optimizer, None, config, scheduler=scheduler,
         )
@@ -865,68 +856,11 @@ def main():
           f'weight_decay={config["weight_decay"]}')
     print(f'{bold("="*70)}')
 
-    best_val_loss = _resumed_best_val_loss
+    best_val_loss = float('inf')
     best_ckpt_path = None
     keep_last_n = config.get('keep_last_n_checkpoints', 3)
     train_start_time = time.time()
     _train_losses = []   # for loss-curve PNG
-
-    # ── CSV log: append-friendly, survives resume ──────────────────────────
-    import csv as _csv
-    _csv_path = os.path.join(config['output_dir'], 'train_log.csv')
-    _csv_fields = ['epoch', 'train_loss', 'val_loss', 'test_loss', 'lr',
-                   'vram_peak_gib', 'epoch_time_s', 'wall_time']
-    # Create header only if file doesn't exist yet
-    if not os.path.exists(_csv_path):
-        with open(_csv_path, 'w', newline='') as _cf:
-            _csv.DictWriter(_cf, fieldnames=_csv_fields).writeheader()
-    print(f'  CSV log: {_csv_path}')
-
-    def _append_csv(row: dict):
-        with open(_csv_path, 'a', newline='') as _cf:
-            _csv.DictWriter(_cf, fieldnames=_csv_fields).writerow(row)
-
-    def _plot_loss_from_csv():
-        """Plot loss curve from the full CSV (includes all resumes)."""
-        try:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            epochs_x, train_y, val_y, test_y = [], [], [], []
-            with open(_csv_path, 'r') as _cf:
-                for r in _csv.DictReader(_cf):
-                    epochs_x.append(int(r['epoch']))
-                    train_y.append(float(r['train_loss']))
-                    vl = r.get('val_loss', '')
-                    val_y.append(float(vl) if vl else None)
-                    tl = r.get('test_loss', '')
-                    test_y.append(float(tl) if tl else None)
-            fig, ax = plt.subplots(figsize=(12, 4))
-            ax.plot(epochs_x, train_y, linewidth=1.0, color='steelblue',
-                    label='train loss', alpha=0.85)
-            val_x = [e for e, v in zip(epochs_x, val_y) if v is not None]
-            val_l = [v for v in val_y if v is not None]
-            if val_l:
-                ax.plot(val_x, val_l, linewidth=1.0, color='tomato',
-                        label='val loss', alpha=0.85)
-            test_x = [e for e, v in zip(epochs_x, test_y) if v is not None]
-            test_l = [v for v in test_y if v is not None]
-            if test_l:
-                ax.plot(test_x, test_l, linewidth=1.0, color='forestgreen',
-                        label='test loss', alpha=0.85)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('Loss')
-            ax.set_title(f'Training Loss \u2014 {args.name}')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            curve_path = os.path.join(config['output_dir'], 'loss_curve.png')
-            fig.savefig(curve_path, dpi=120, bbox_inches='tight')
-            plt.close(fig)
-        except Exception:
-            pass  # non-critical
-
-    # ── Global optimizer step counter (correct across resumes) ─────────────
-    _global_opt_step = _resumed_global_step
 
     # === OVERFIT TEST ===
     _overfit_mode = config.get('_overfit_mode', False)
@@ -1043,6 +977,13 @@ def main():
                     thumb_size=256,
                 )
                 print(f'  {bold_green("[MilestoneGrid]")} {grid_label} → {_gp}')
+                # Log to WandB
+                try:
+                    wandb.log({
+                        f'vis/{grid_label}': wandb.Image(_gp, caption=f'{grid_label} step {global_step}'),
+                    })
+                except Exception:
+                    pass
             except Exception as _e:
                 print(f'  {bold_yellow("[MilestoneVis WARN]")} {grid_label} step {global_step}: {_e}')
 
@@ -1061,7 +1002,7 @@ def main():
 
         # Train
         print(f'\n--- {bold_magenta(f"Epoch {epoch}/{total_epochs-1}")}  ({bold_cyan(f"{epoch_progress:.0f}%")} done) ---')
-        train_loss, _epoch_opt_steps = train_one_epoch(
+        train_loss = train_one_epoch(
             epoch, hdc2a, transformer, vae, bn_mean, bn_std,
             train_loader, optimizer, None, config, scheduler=scheduler,
             step_vis_callback=_active_step_vis_callback,
@@ -1070,26 +1011,9 @@ def main():
         epoch_time = time.time() - epoch_start
         elapsed = time.time() - train_start_time
         epochs_done = epoch - start_epoch + 1
-        remaining_epochs = total_epochs - start_epoch - epochs_done
-        eta_min = elapsed / epochs_done * remaining_epochs / 60
-        # Track optimizer steps done this epoch (exact count from train loop)
-        _global_opt_step += _epoch_opt_steps
-
-        # VRAM peak — only measure first epoch (reset/max_memory adds negligible overhead)
-        if epoch == start_epoch:
-            _vram_peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
-            torch.cuda.reset_peak_memory_stats()
-        else:
-            _vram_peak = None
-
-        wall_str = time.strftime('%Y-%m-%d %H:%M:%S')
-        _peak_str = f'  VRAM peak: {_vram_peak:.2f} GiB' if _vram_peak is not None else ''
-        _cur_lr = optimizer.param_groups[0]['lr']
+        eta = elapsed / epochs_done * (total_epochs - start_epoch - epochs_done)
         print(f'  Train loss: {yellow(f"{train_loss:.6f}")} ({epoch_time:.1f}s)  '
-              f'LR: {cyan(f"{_cur_lr:.2e}")}  '
-              f'opt_steps: {_global_opt_step}  '
-              f'ETA: {cyan(f"{eta_min:.0f} min")}  '
-              f'{gray(wall_str)}{_peak_str}')
+              f'ETA: {cyan(f"{eta/60:.0f}min")}')
         _train_losses.append((epoch, train_loss))
 
         wandb.log({
@@ -1098,30 +1022,17 @@ def main():
             "adapter_lr": optimizer.param_groups[0]['lr'],
             "gpu_mem_gib": torch.cuda.memory_allocated() / (1024 ** 3),
             "cpu_pct": psutil.cpu_percent(),
-            "global_opt_step": _global_opt_step,
         })
 
-        # Validate + Test
+        # Validate
         val_loss = None
-        test_loss = None
         if val_loader is not None and (epoch + 1) % config['val_every_n_epochs'] == 0:
             val_loss = validate(
                 epoch, hdc2a, transformer, vae, bn_mean, bn_std,
                 val_loader, config,
             )
-            if test_loader is not None:
-                test_loss = validate(
-                    epoch, hdc2a, transformer, vae, bn_mean, bn_std,
-                    test_loader, config,
-                )
-            _loss_parts = [f'Val: {val_loss:.6f}']
-            if test_loss is not None:
-                _loss_parts.append(f'Test: {test_loss:.6f}')
-            print(f'  {" | ".join(_loss_parts)}')
-            _log_dict = {"val_loss": val_loss}
-            if test_loss is not None:
-                _log_dict["test_loss"] = test_loss
-            wandb.log(_log_dict)
+            print(f'  Val loss: {val_loss:.6f}')
+            wandb.log({"val_loss": val_loss})
 
             # save_checkpoint handles best tracking + rotation internally
             _, _, best_val_loss, best_ckpt_path = save_checkpoint(
@@ -1130,8 +1041,6 @@ def main():
                 keep_last_n=keep_last_n,
                 best_loss=best_val_loss,
                 best_ckpt_path=best_ckpt_path,
-                scheduler=scheduler,
-                global_step=_global_opt_step,
             )
 
         # Periodic checkpoint (even when no val this epoch)
@@ -1149,28 +1058,37 @@ def main():
                     keep_last_n=keep_last_n,
                     best_loss=best_val_loss,
                     best_ckpt_path=best_ckpt_path,
-                    scheduler=scheduler,
-                    global_step=_global_opt_step,
                 )
-
-        # ── CSV row + loss plot ─────────────────────────────────────────────
-        _append_csv({
-            'epoch': epoch,
-            'train_loss': f'{train_loss:.6f}',
-            'val_loss': f'{val_loss:.6f}' if val_loss is not None else '',
-            'test_loss': f'{test_loss:.6f}' if test_loss is not None else '',
-            'lr': f'{optimizer.param_groups[0]["lr"]:.2e}',
-            'vram_peak_gib': f'{_vram_peak:.2f}' if _vram_peak is not None else '',
-            'epoch_time_s': f'{epoch_time:.1f}',
-            'wall_time': wall_str,
-        })
-        _plot_loss_from_csv()
 
         check_memory(f'epoch {epoch} end')
 
-    # ── Post-training: final loss curve from CSV ──────────────────────────────
-    _plot_loss_from_csv()
-    print(f'  {bold_green("[LossCurve]")} saved → {os.path.join(config["output_dir"], "loss_curve.png")}')
+    # ── Post-training: loss curve ────────────────────────────────────────────
+    # (milestone big grids are already saved at each checkpoint above)
+    # Loss curve PNG (always saved)
+    if _train_losses:
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            epochs_x   = [e for e, _ in _train_losses]
+            losses_y   = [l for _, l in _train_losses]
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(epochs_x, losses_y, linewidth=1.0, color='steelblue', label='train loss')
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Loss')
+            ax.set_title(f'Training Loss — {args.name}')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            curve_path = os.path.join(config['output_dir'], 'loss_curve.png')
+            fig.savefig(curve_path, dpi=120, bbox_inches='tight')
+            plt.close(fig)
+            print(f'  {bold_green("[LossCurve]")} saved → {curve_path}')
+            try:
+                wandb.log({'loss_curve': wandb.Image(curve_path)})
+            except Exception:
+                pass
+        except Exception as _e:
+            print(f'  {bold_yellow("[LossCurve WARN]")} could not save loss curve: {_e}')
 
     # ── Cleanup ─────────────────────────────────────────────────────────────
     print(f'\n{"="*70}')
