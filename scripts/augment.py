@@ -122,8 +122,8 @@ def _color_jitter(rgb, brightness, contrast, saturation, hue):
                 [k*k*(1-cos_a)+k*sin_a,   cos_a + k*k*(1-cos_a), k*k*(1-cos_a)-k*sin_a],
                 [k*k*(1-cos_a)-k*sin_a,   k*k*(1-cos_a)+k*sin_a, cos_a + k*k*(1-cos_a)],
             ], dtype=out.dtype, device=out.device)
-            flat = out.view(3, -1)
-            out = (R @ flat).view_as(out).clamp(0, 1)
+            flat = out.reshape(3, -1)
+            out = (R @ flat).reshape_as(out).clamp(0, 1)
     return out
 
 
