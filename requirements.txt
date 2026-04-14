@@ -1,0 +1,13 @@
+# HDC2A + Flux2 ControlNet Training
+# Tested with Python 3.12, CUDA 12.8
+
+torch>=2.1.0
+numpy
+Pillow
+psutil
+safetensors
+wandb
+
+# Imported inside functions (lazy-loaded to save startup time)
+diffusers>=0.30.0
+transformers>=4.40.0

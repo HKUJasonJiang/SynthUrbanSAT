@@ -1,0 +1,35 @@
+# HDC²A + Flux2 ControlNet Training Environment
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate flux_train
+#
+# Tested on: Python 3.12, CUDA 12.8, PyTorch 2.10
+
+name: flux_train
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+    # ── Core ──
+    - torch>=2.1.0
+    - torchvision
+    - torchaudio
+    # ── Diffusion ──
+    - diffusers>=0.30.0
+    - transformers>=4.40.0
+    - accelerate
+    - safetensors
+    # ── Data ──
+    - numpy
+    - Pillow
+    - einops
+    # ── Training ──
+    - wandb
+    - psutil
+    # ── Text Encoder ──
+    - sentencepiece

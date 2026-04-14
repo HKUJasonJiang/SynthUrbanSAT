@@ -1,0 +1,32 @@
+# Checkpoints & Output
+output/
+
+# Weights (downloaded from HuggingFace)
+weights/
+
+# Dataset (downloaded from HuggingFace)
+dataset/
+
+# Other dataset variants (large image files)
+dataset_DFC2018/
+dataset_example/
+dataset_small/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# WandB
+wandb/
+
+# OS
+.DS_Store
+
+# Upload script (one-time use)
+_upload_hf.py
+
+# Logs
+nohup.out
+*.log
+_upload_remaining.py
