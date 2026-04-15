@@ -31,8 +31,8 @@ def main():
     parser = argparse.ArgumentParser(description="Upload experiment output to HuggingFace")
     parser.add_argument("--name", required=True,
                         help="Experiment name (matches output/<name>/ folder)")
-    parser.add_argument("--repo", default="JasonXF/SynthUrbanSAT",
-                        help="HuggingFace repo ID (default: JasonXF/SynthUrbanSAT)")
+    parser.add_argument("--repo", default="JasonXF/SynthUrbanSAT-Output",
+                        help="HuggingFace repo ID (default: JasonXF/SynthUrbanSAT-Output)")
     parser.add_argument("--path-in-repo", default=None,
                         help="Remote path prefix in the repo (default: output/<name>)")
     args = parser.parse_args()
