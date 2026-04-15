@@ -32,6 +32,13 @@ from scripts.colors import (
 )
 
 
+# Timestep bins for stratified validation loss monitoring.
+# Each bin covers a sub-range of t ∈ [0, 1]:
+#   t→0  (denoising, fine detail)  |  t→1  (pure noise, global structure)
+VAL_T_BINS = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0)]
+VAL_T_BIN_LABELS = [f't_{lo:.1f}-{hi:.1f}' for lo, hi in VAL_T_BINS]
+
+
 def sample_timestep(batch_size, device):
     """Sample random timestep in [0, 1] for flow matching.
     Uses logit-normal distribution (biased toward t=0.5) for better gradient signal.
@@ -243,10 +250,15 @@ def train_one_epoch(epoch, hdc2a, transformer, vae, bn_mean, bn_std,
 @torch.no_grad()
 def validate(epoch, hdc2a, transformer, vae, bn_mean, bn_std,
              val_loader, config):
-    """Run validation.
+    """Run validation with timestep-stratified loss breakdown.
+
+    Samples t ~ U[0,1] per sample so every bin gets coverage over the val set.
+    Per-sample MSE is accumulated into 5 bins:
+        t∈[0.0,0.2)  t∈[0.2,0.4)  t∈[0.4,0.6)  t∈[0.6,0.8)  t∈[0.8,1.0]
 
     Returns:
-        avg_loss: average validation loss
+        avg_loss (float): mean MSE across all samples (uniform t)
+        t_bin_losses (dict): {bin_label: avg_mse_in_bin}
     """
     hdc2a.eval()
     transformer.eval()
@@ -256,6 +268,8 @@ def validate(epoch, hdc2a, transformer, vae, bn_mean, bn_std,
 
     total_loss = 0.0
     num_batches = 0
+    # bin_accum[i] = [sum_loss, count]
+    bin_accum = [[0.0, 0] for _ in VAL_T_BINS]
 
     for batch in val_loader:
         rgb = batch['rgb'].to(device, dtype=dtype)
@@ -266,7 +280,8 @@ def validate(epoch, hdc2a, transformer, vae, bn_mean, bn_std,
         target_packed, patchified = encode_rgb_to_latent(vae, rgb, bn_mean, bn_std, dtype)
         latent_ids = prepare_latent_ids(patchified, device)
 
-        t = torch.full((B,), 0.5, device=device)  # fixed t=0.5 for val consistency
+        # Uniform t sampling → cross-bin coverage across the whole val set
+        t = torch.rand(B, device=device)
         noisy_latent, noise, flow_target = flow_matching_forward(target_packed, t)
 
         seq_len = config.get('text_seq_len', 512)
@@ -294,13 +309,30 @@ def validate(epoch, hdc2a, transformer, vae, bn_mean, bn_std,
                 return_dict=False,
             )
             noise_pred = output[0]
-            loss = F.mse_loss(noise_pred, flow_target)
+            # Per-sample MSE: [B, N, C] → mean over tokens+channels → [B]
+            per_sample_loss = F.mse_loss(
+                noise_pred.float(), flow_target.float(), reduction='none'
+            ).mean(dim=[1, 2])  # [B]
 
-        total_loss += loss.item()
+        avg_batch_loss = per_sample_loss.mean().item()
+        total_loss += avg_batch_loss
         num_batches += 1
 
+        # Accumulate into timestep bins (per sample)
+        t_cpu = t.cpu()
+        loss_cpu = per_sample_loss.detach().float().cpu()
+        for i in range(B):
+            # bin index: floor(t * 5), clamped to [0, 4]
+            bi = min(int(t_cpu[i].item() * len(VAL_T_BINS)), len(VAL_T_BINS) - 1)
+            bin_accum[bi][0] += loss_cpu[i].item()
+            bin_accum[bi][1] += 1
+
     avg_loss = total_loss / max(num_batches, 1)
-    return avg_loss
+    t_bin_losses = {
+        VAL_T_BIN_LABELS[i]: (s / max(c, 1))
+        for i, (s, c) in enumerate(bin_accum)
+    }
+    return avg_loss, t_bin_losses
 
 
 def save_checkpoint(epoch, hdc2a, transformer, optimizer, loss, output_dir, config,

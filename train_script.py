@@ -1049,12 +1049,16 @@ def main():
         # Validate
         val_loss = None
         if val_loader is not None and (epoch + 1) % config['val_every_n_epochs'] == 0:
-            val_loss = validate(
+            val_loss, _val_t_bins = validate(
                 epoch, hdc2a, transformer, vae, bn_mean, bn_std,
                 val_loader, config,
             )
-            print(f'  Val loss: {val_loss:.6f}')
-            wandb.log({"val_loss": val_loss})
+            # Print overall + per-bin losses
+            _bin_str = '  '.join(f'{k}={v:.4f}' for k, v in _val_t_bins.items())
+            print(f'  Val loss: {val_loss:.6f}  [{_bin_str}]')
+            _wandb_val = {"val_loss": val_loss}
+            _wandb_val.update({f'val/{k}': v for k, v in _val_t_bins.items()})
+            wandb.log(_wandb_val)
 
             # save_checkpoint handles best tracking + rotation internally
             _, _, best_val_loss, best_ckpt_path = save_checkpoint(
