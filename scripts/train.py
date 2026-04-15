@@ -15,10 +15,13 @@ All functions take a `config` dict (from train_script.py CONFIG).
 import math
 import os
 import time
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
 
 from scripts.models import HDC2AAdapter, FP8FrozenLinear
@@ -125,10 +128,17 @@ def train_one_epoch(epoch, hdc2a, transformer, vae, bn_mean, bn_std,
     total_steps = total_epochs * steps_per_epoch
     epoch_t0 = time.time()
 
+    # DDP-aware flags (computed once, not per step)
+    _is_ddp = isinstance(hdc2a, DDP)
+    _is_distributed = dist.is_initialized() and dist.get_world_size() > 1
+    _is_main = not dist.is_initialized() or dist.get_rank() == 0
+
     for step, batch in enumerate(train_loader):
         rgb = batch['rgb'].to(device, dtype=dtype)        # [B, 3, H, W]
         seg = batch['seg'].to(device)                      # [B, H, W] long
         depth = batch['depth'].to(device, dtype=dtype)     # [B, 1, H, W]
+        if config.get('disable_depth', False):
+            depth = torch.zeros_like(depth)
         B = rgb.shape[0]
 
         # Encode RGB → latent tokens
@@ -183,9 +193,22 @@ def train_one_epoch(epoch, hdc2a, transformer, vae, bn_mean, bn_std,
             else:
                 loss = F.mse_loss(noise_pred, flow_target) / grad_accum_steps
 
-        loss.backward()
+        # DDP gradient sync: defer allreduce until the last accumulation step
+        _is_last_accum = (step + 1) % grad_accum_steps == 0
+        _is_epoch_end = (step + 1) == steps_per_epoch
+        _should_step = _is_last_accum or _is_epoch_end
 
-        if (step + 1) % grad_accum_steps == 0:
+        _sync_ctx = hdc2a.no_sync() if (_is_ddp and not _should_step) else nullcontext()
+        with _sync_ctx:
+            loss.backward()
+
+        if _should_step:
+            # Sync transformer trainable gradients across ranks (manual, not DDP-managed)
+            if _is_distributed:
+                for p in transformer.parameters():
+                    if p.requires_grad and p.grad is not None:
+                        dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
             # Clip gradients
             all_params = list(hdc2a.parameters()) + [
                 p for p in transformer.parameters() if p.requires_grad]
@@ -201,9 +224,9 @@ def train_one_epoch(epoch, hdc2a, transformer, vae, bn_mean, bn_std,
         total_loss += batch_loss
         num_batches += 1
 
-        # Logging
+        # Logging (rank 0 only)
         global_step = epoch * steps_per_epoch + step
-        if (step + 1) % log_interval == 0:
+        if _is_main and (step + 1) % log_interval == 0:
             avg = total_loss / num_batches
             vram = torch.cuda.memory_allocated() / (1024 ** 3)
             progress_pct = (global_step + 1) / total_steps * 100
@@ -232,18 +255,14 @@ def train_one_epoch(epoch, hdc2a, transformer, vae, bn_mean, bn_std,
                 transformer.train()
         # === END OVERFIT TEST ===
 
-    # Flush remaining accumulated gradients (when steps not divisible by grad_accum)
-    if num_batches > 0 and num_batches % grad_accum_steps != 0:
-        all_params = list(hdc2a.parameters()) + [
-            p for p in transformer.parameters() if p.requires_grad]
-        torch.nn.utils.clip_grad_norm_(all_params, max_grad_norm)
-        optimizer.step()
-        opt_steps += 1
-        if scheduler is not None:
-            scheduler.step()
-        optimizer.zero_grad()
-
     avg_loss = total_loss / max(num_batches, 1)
+
+    # Distributed: average loss across ranks for consistent reporting
+    if _is_distributed:
+        _loss_tensor = torch.tensor([avg_loss], device=device)
+        dist.all_reduce(_loss_tensor, op=dist.ReduceOp.AVG)
+        avg_loss = _loss_tensor.item()
+
     return avg_loss, opt_steps
 
 
@@ -275,6 +294,8 @@ def validate(epoch, hdc2a, transformer, vae, bn_mean, bn_std,
         rgb = batch['rgb'].to(device, dtype=dtype)
         seg = batch['seg'].to(device)
         depth = batch['depth'].to(device, dtype=dtype)
+        if config.get('disable_depth', False):
+            depth = torch.zeros_like(depth)
         B = rgb.shape[0]
 
         target_packed, patchified = encode_rgb_to_latent(vae, rgb, bn_mean, bn_std, dtype)
@@ -328,6 +349,20 @@ def validate(epoch, hdc2a, transformer, vae, bn_mean, bn_std,
             bin_accum[bi][1] += 1
 
     avg_loss = total_loss / max(num_batches, 1)
+
+    # Distributed: aggregate losses across ranks
+    _is_distributed = dist.is_initialized() and dist.get_world_size() > 1
+    if _is_distributed:
+        _loss_t = torch.tensor([avg_loss], device=config['device'])
+        dist.all_reduce(_loss_t, op=dist.ReduceOp.AVG)
+        avg_loss = _loss_t.item()
+
+        # Aggregate bin counts and sums across all ranks
+        for i in range(len(bin_accum)):
+            _bin_t = torch.tensor(bin_accum[i], device=config['device'])
+            dist.all_reduce(_bin_t, op=dist.ReduceOp.SUM)
+            bin_accum[i] = [_bin_t[0].item(), int(_bin_t[1].item())]
+
     t_bin_losses = {
         VAL_T_BIN_LABELS[i]: (s / max(c, 1))
         for i, (s, c) in enumerate(bin_accum)
@@ -501,6 +536,8 @@ def test_forward_pass(hdc2a, transformer, vae, bn_mean, bn_std, config):
     seg = torch.randint(0, config.get('num_classes', 5),
                         (1, img_size, img_size), device=device)
     depth = torch.rand(1, 1, img_size, img_size, device=device, dtype=dtype)
+    if config.get('disable_depth', False):
+        depth = torch.zeros_like(depth)
 
     target_packed, patchified = encode_rgb_to_latent(vae, rgb, bn_mean, bn_std, dtype)
     latent_ids = prepare_latent_ids(patchified, device)

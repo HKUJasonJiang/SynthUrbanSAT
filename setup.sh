@@ -15,8 +15,11 @@
 #   Alternatively, pass via environment:  HF_TOKEN_READ=hf_xxx bash setup.sh
 #
 # Usage:
-#   bash setup.sh                          # full setup + test
+#   bash setup.sh                          # full setup + single-GPU test
 #   bash setup.sh --skip-test              # skip smoke test
+#   bash setup.sh --test-single-gpu 0      # single-GPU test on GPU 0
+#   bash setup.sh --test-multi-gpu 0,1,2,3 # multi-GPU (DDP) test on 4 GPUs
+#   bash setup.sh --test-both 0,1,2,3      # run both single-GPU and multi-GPU tests
 #
 # After this passes, run training with:
 #   bash run_train.sh
@@ -67,10 +70,15 @@ header(){ echo -e "\n${BOLD}${CYAN}═══════════════
 
 # ── Parse args ───────────────────────────────────────────────────────────────
 SKIP_TEST=false
+TEST_MODE="single"        # single | multi | both
+TEST_DEVICES="0"          # CUDA_VISIBLE_DEVICES for tests
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --skip-test)  SKIP_TEST=true; shift ;;
-        *)            shift ;;
+        --skip-test)          SKIP_TEST=true; shift ;;
+        --test-single-gpu)    TEST_MODE="single";  TEST_DEVICES="${2:-0}"; shift 2 ;;
+        --test-multi-gpu)     TEST_MODE="multi";   TEST_DEVICES="${2:-0,1}"; shift 2 ;;
+        --test-both)          TEST_MODE="both";    TEST_DEVICES="${2:-0,1}"; shift 2 ;;
+        *)                    shift ;;
     esac
 done
 
@@ -219,9 +227,10 @@ ok "Python: $PY_VER"
 TORCH_INFO=$("$PYTHON" -c "
 import torch
 cuda_ok = torch.cuda.is_available()
+gpu_count = torch.cuda.device_count() if cuda_ok else 0
 gpu = torch.cuda.get_device_name() if cuda_ok else 'N/A'
 vram = torch.cuda.get_device_properties(0).total_memory / 1e9 if cuda_ok else 0
-print(f'torch={torch.__version__} cuda={torch.version.cuda} gpu={gpu} vram={vram:.1f}GB cuda_ok={cuda_ok}')
+print(f'torch={torch.__version__} cuda={torch.version.cuda} gpu={gpu} vram={vram:.1f}GB cuda_ok={cuda_ok} gpus={gpu_count}')
 " 2>&1) || { fail "torch import failed"; CHECKS_PASSED=false; }
 
 if [[ "$TORCH_INFO" == *"cuda_ok=True"* ]]; then
@@ -229,6 +238,36 @@ if [[ "$TORCH_INFO" == *"cuda_ok=True"* ]]; then
 else
     fail "CUDA not available: $TORCH_INFO"
     CHECKS_PASSED=false
+fi
+
+# GPU count & details
+NUM_GPUS=$("$PYTHON" -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 0)
+if [[ "$NUM_GPUS" -ge 1 ]]; then
+    ok "GPUs detected: $NUM_GPUS"
+    "$PYTHON" -c "
+import torch
+for i in range(torch.cuda.device_count()):
+    name = torch.cuda.get_device_name(i)
+    vram = torch.cuda.get_device_properties(i).total_memory / 1e9
+    print(f'       GPU {i}: {name}  ({vram:.1f} GB)')
+"
+    if [[ "$NUM_GPUS" -ge 2 ]]; then
+        ok "Multi-GPU (DDP) is available with $NUM_GPUS GPUs"
+    else
+        warn "Only 1 GPU — multi-GPU (DDP) training not available on this machine"
+    fi
+else
+    fail "No GPUs detected"
+    CHECKS_PASSED=false
+fi
+
+# torchrun (required for multi-GPU DDP)
+TORCHRUN="$CONDA_BASE/envs/$ENV_NAME/bin/torchrun"
+if [[ -x "$TORCHRUN" ]]; then
+    ok "torchrun: $TORCHRUN"
+else
+    warn "torchrun not found at $TORCHRUN — multi-GPU (DDP) will not work"
+    warn "torchrun is bundled with PyTorch; try: pip install torch>=2.1.0"
 fi
 
 # Key packages (import_name:pip_package)
@@ -288,30 +327,95 @@ ok "All dependencies OK"
 # ═══════════════════════════════════════════════════════════════════════════════
 header "Smoke Test"
 
+# ── Helper: run single-GPU test ──────────────────────────────────────────────
+run_single_gpu_test() {
+    local gpu="${1%%,*}"  # take first GPU if comma-separated list given
+    local ts=$(date +%Y%m%d_%H%M%S)
+    local log="$LOG_DIR/test_single_gpu_${ts}.log"
+    info "[Single-GPU] Running on GPU $gpu ..."
+    info "Log: $log"
+    echo ""
+    if CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON" -u train_script.py \
+            --test --no-wandb --name _smoke_test_1gpu 2>&1 | tee "$log"; then
+        echo ""
+        ok "[Single-GPU] PASSED  (GPU $gpu)"
+        ok "Log: $log"
+        return 0
+    else
+        echo ""
+        fail "[Single-GPU] FAILED  (GPU $gpu)"
+        fail "Log: $log"
+        return 1
+    fi
+}
+
+# ── Helper: run multi-GPU (DDP) test ─────────────────────────────────────────
+run_multi_gpu_test() {
+    local gpus="$1"
+    local nproc=$(echo "$gpus" | tr ',' '\n' | wc -l)
+    local ts=$(date +%Y%m%d_%H%M%S)
+    local log="$LOG_DIR/test_multi_gpu_${ts}.log"
+    info "[Multi-GPU]  Running DDP on GPUs $gpus ($nproc processes) ..."
+    info "Log: $log"
+    echo ""
+    local TORCHRUN="$CONDA_BASE/envs/$ENV_NAME/bin/torchrun"
+    if CUDA_VISIBLE_DEVICES="$gpus" "$TORCHRUN" \
+            --nproc_per_node="$nproc" --master_port=29599 \
+            train_script.py --test --no-wandb --name _smoke_test_ddp 2>&1 | tee "$log"; then
+        echo ""
+        ok "[Multi-GPU]  PASSED  (GPUs $gpus, $nproc processes)"
+        ok "Log: $log"
+        return 0
+    else
+        echo ""
+        fail "[Multi-GPU]  FAILED  (GPUs $gpus)"
+        fail "Log: $log"
+        return 1
+    fi
+}
+
 if [[ "$SKIP_TEST" == "true" ]]; then
     warn "Skipping smoke test (--skip-test)"
 else
-    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    TEST_LOG="$LOG_DIR/test_${TIMESTAMP}.log"
-    info "Running: python train_script.py --test"
-    info "Log: $TEST_LOG"
-    echo ""
+    TEST_OK=true
 
-    # Force colors in piped output
-    if "$PYTHON" -u train_script.py --test --no-wandb --name _smoke_test 2>&1 | tee "$TEST_LOG"; then
+    if [[ "$TEST_MODE" == "single" || "$TEST_MODE" == "both" ]]; then
+        run_single_gpu_test "$TEST_DEVICES" || TEST_OK=false
         echo ""
-        ok "Smoke test PASSED"
-        ok "Log: $TEST_LOG"
-    else
+    fi
+
+    if [[ "$TEST_MODE" == "multi" || "$TEST_MODE" == "both" ]]; then
+        # multi-GPU needs at least 2 GPUs — check both args and actual hardware
+        GPU_COUNT=$(echo "$TEST_DEVICES" | tr ',' '\n' | wc -l)
+        ACTUAL_GPUS=$("$PYTHON" -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 0)
+
+        if [[ "$ACTUAL_GPUS" -lt 2 ]]; then
+            warn "[Multi-GPU] Skipped — only $ACTUAL_GPUS GPU(s) on this machine, need at least 2 for DDP test"
+            warn "Single-GPU test is sufficient here."
+        elif [[ "$GPU_COUNT" -lt 2 ]]; then
+            warn "[Multi-GPU] Skipped — need at least 2 GPU IDs but got: $TEST_DEVICES"
+            warn "Usage: bash setup.sh --test-multi-gpu 0,1"
+        elif [[ "$ACTUAL_GPUS" -lt "$GPU_COUNT" ]]; then
+            # Requested more GPUs than available — auto-trim to what we have
+            TRIMMED=$(seq 0 $(( ACTUAL_GPUS - 1 )) | paste -sd,)
+            warn "[Multi-GPU] Requested $GPU_COUNT GPUs but only $ACTUAL_GPUS available — using GPUs: $TRIMMED"
+            run_multi_gpu_test "$TRIMMED" || TEST_OK=false
+        else
+            run_multi_gpu_test "$TEST_DEVICES" || TEST_OK=false
+        fi
         echo ""
+    fi
+
+    if [[ "$TEST_OK" != "true" ]]; then
         fail "Smoke test FAILED (see log above)"
-        fail "Log: $TEST_LOG"
         fail ""
-        fail "Common issues:"
         fail "  • OOM: reduce --image-size in run_train.sh"
         fail "  • Missing weights: check weights/ symlinks"
         fail "  • Import errors: pip install -r requirements.txt"
+        fail "  • DDP errors: check NCCL_DEBUG=INFO output"
         exit 1
+    else
+        ok "All smoke tests PASSED"
     fi
 fi
 

@@ -8,6 +8,9 @@ tifffile
 psutil
 safetensors
 wandb
+accelerate
+einops
+sentencepiece
 
 # Imported inside functions (lazy-loaded to save startup time)
 diffusers>=0.30.0

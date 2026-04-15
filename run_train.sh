@@ -3,11 +3,16 @@
 # HDC²A + Flux2 ControlNet  —  Training Launch Script
 #
 # Usage:
-#   bash run_train.sh                    # train with settings below
+#   bash run_train.sh                    # train with settings below (single GPU)
 #   bash run_train.sh --test             # smoke test (forward only)
 #   bash run_train.sh --test-data        # 1-step data test
 #   bash run_train.sh --overfit          # overfit sanity check
 #   bash run_train.sh --no-wandb         # disable WandB
+#
+# Multi-GPU:
+#   Set GPUS="0,1,2,3" below to control which GPUs to use.
+#   The script automatically uses torchrun for multi-GPU training.
+#   Each experiment script can set different GPUS to avoid conflicts.
 #
 # All defaults below match CONFIG in train_script.py.
 # --name is REQUIRED: output goes to output/<NAME>/, WandB project = <NAME>.
@@ -39,6 +44,15 @@ if [[ -f "$SCRIPT_DIR/.env" ]]; then
 fi
 
 # ══════════════════════════  EDIT BELOW  ══════════════════════════════════════
+
+# ── GPU selection ────────────────────────────────────────────────────────────
+# Comma-separated GPU IDs to use. Examples:
+#   GPUS="0"           → single GPU (no torchrun)
+#   GPUS="0,1"         → 2 GPUs via torchrun
+#   GPUS="0,1,2,3"     → 4 GPUs via torchrun
+#   GPUS="4,5,6,7"     → GPUs 4-7 (e.g. second experiment on same node)
+# Can be overridden via env: GPUS="0,1" bash run_train.sh
+GPUS="${GPUS:-0}"
 
 # ── Run name (required, maps to output dir + WandB project) ──────────────────
 NAME="hdc2a_run"                 # output/<NAME>/  ;  --wandb-project defaults to this
@@ -100,8 +114,24 @@ AUGMENT=false                    # true = --augment, false = --no-augment
 # Launch
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── Compute GPU count and set CUDA_VISIBLE_DEVICES ───────────────────────────
+export CUDA_VISIBLE_DEVICES="$GPUS"
+# Count GPUs: number of comma-separated items
+NUM_GPUS=$(echo "$GPUS" | tr ',' '\n' | wc -l)
+
+# Build the launcher prefix: torchrun for multi-GPU, plain python for single GPU
+if [[ "$NUM_GPUS" -gt 1 ]]; then
+    LAUNCHER=(
+        "$CONDA_BASE/envs/$ENV_NAME/bin/torchrun"
+        --nproc_per_node="$NUM_GPUS"
+        --master_port="${MASTER_PORT:-29500}"
+    )
+else
+    LAUNCHER=("$PYTHON" -u)
+fi
+
 CMD=(
-    "$PYTHON" -u train_script.py
+    "${LAUNCHER[@]}" train_script.py
     --name "$NAME"
     --transformer-path "$TRANSFORMER_PATH"
     --vae-path "$VAE_PATH"
@@ -170,6 +200,7 @@ echo "════════════════════════�
 echo "  HDC²A Training  |  $(date)"
 echo "  Python: $PYTHON"
 echo "  Name:   $NAME"
+echo "  GPUs:   $GPUS ($NUM_GPUS GPU(s))"
 echo "  Mode:   $(if $IS_TEST; then echo 'TEST'; else echo 'TRAIN'; fi)"
 echo "═══════════════════════════════════════════════════════════════"
 

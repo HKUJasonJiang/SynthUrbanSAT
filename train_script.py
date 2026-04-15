@@ -39,6 +39,8 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 import psutil
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
 
 # ── Make project root the working directory & importable ────────────────────
@@ -99,6 +101,37 @@ class _TeeLogger:
         return self._stream.fileno()
     def isatty(self):
         return self._stream.isatty() if hasattr(self._stream, 'isatty') else False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Distributed training helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def setup_distributed():
+    """Initialize distributed training if launched via torchrun.
+
+    Returns:
+        (rank, world_size, local_rank)
+    """
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        dist.init_process_group(backend='nccl')                 # init distributed backend, A100
+        torch.cuda.set_device(local_rank)
+        return rank, world_size, local_rank
+    return 0, 1, 0
+
+
+def is_main_process():
+    """Return True if this is rank 0 (or single-GPU mode)."""
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def cleanup_distributed():
+    """Destroy the process group."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -294,15 +327,25 @@ def parse_args():
                    help=('Run name (required). Output is saved to output/<name>/. '
                          'E.g. python train_script.py --name hdc2a_only'))
 
+    # ── Ablation controls ──
+    p.add_argument('--disable-depth', action='store_true',
+                   help='Zero out depth input to HDC²A (seg-only ablation).')
+    p.add_argument('--no-minsnr', action='store_true',
+                   help='Disable min-SNR loss weighting; use uniform weight w=1.')
+
+    # ── LoRA (enabled by default, disable with --no-lora) ──
+    p.add_argument('--no-lora', action='store_true',
+                   help='Disable LoRA injection (by default LoRA is ON with rank=32).')
+    p.add_argument('--lora-rank', type=int, default=32,
+                   help='LoRA rank (default: 32).')
+    p.add_argument('--lora-alpha', type=float, default=None,
+                   help='LoRA alpha (default: same as --lora-rank).')
+
     # === OVERFIT TEST ===
     p.add_argument('--overfit', action='store_true',
                    help=('过拟合 sanity check 模式。自动使用 dataset_small，'
                          '给 ControlNet 加 LoRA，固定 LR，2000 epochs。'
                          '改为 False（不传此参数）即恢复正常训练。'))
-    p.add_argument('--lora-rank', type=int, default=32,
-                   help='LoRA rank（仅 --overfit 模式生效，默认 32）。')
-    p.add_argument('--lora-alpha', type=float, default=32.0,
-                   help='LoRA alpha（仅 --overfit 模式生效，默认 32.0）。')
     p.add_argument('--vis-every', type=int, default=50,
                    help='每隔 N 个 epoch 保存可视化图像（仅 --overfit 模式，默认 50）。')
     # === END OVERFIT TEST ===
@@ -453,13 +496,18 @@ def main():
 
     config = CONFIG.copy()
 
+    # ── Distributed training setup ──────────────────────────────────────────
+    rank, world_size, local_rank = setup_distributed()
+    is_main = (rank == 0)
+
     # === OVERFIT TEST ===
     # 先把 OVERFIT_DEFAULTS 合并进来，顺序：CONFIG → OVERFIT_DEFAULTS → CLI args
     # 这样 CLI 参数依然可以覆盖 overfit 默认值（保持灵活性）
     if args.overfit:
         config.update(OVERFIT_DEFAULTS)
         config['_overfit_mode'] = True
-        print(f'\n{bold_red("="*60)}\n  {bold_red("OVERFIT TEST MODE 过拟合测试模式")} — 仅用于 sanity check\n{bold_red("="*60)}')
+        if is_main:
+            print(f'\n{bold_red("="*60)}\n  {bold_red("OVERFIT TEST MODE 过拟合测试模式")} — 仅用于 sanity check\n{bold_red("="*60)}')
     else:
         config['_overfit_mode'] = False
     lora_modules = {}  # 仅 overfit 模式下填充
@@ -517,11 +565,17 @@ def main():
         config['wandb_project'] = args.name
 
     if args.seed is not None:
-        torch.manual_seed(args.seed)
-        torch.cuda.manual_seed_all(args.seed)
+        torch.manual_seed(args.seed + rank)  # different seed per rank for data variety
+        torch.cuda.manual_seed_all(args.seed + rank)
 
     if args.no_wandb:
         os.environ['WANDB_MODE'] = 'disabled'
+
+    # ── Ablation flags → config ─────────────────────────────────────────────
+    if args.disable_depth:
+        config['disable_depth'] = True
+    if args.no_minsnr:
+        config['minsnr_loss_weight'] = False
 
     # ── --name: fixed output dir + internal log tee ───────────────────
     # output/<name>/  is created automatically.
@@ -530,12 +584,16 @@ def main():
 
     os.makedirs(config['output_dir'], exist_ok=True)
 
-    log_path = os.path.join(config['output_dir'], 'train.log')
-    _log_file = open(log_path, 'a', buffering=1, encoding='utf-8')
-    sys.stdout = _TeeLogger(sys.__stdout__, _log_file)
-    sys.stderr = _TeeLogger(sys.__stderr__, _log_file)
-    print(f'Run dir : {config["output_dir"]}')
-    print(f'Log file: {log_path}')
+    # Only rank 0 tees stdout/stderr to the log file
+    if is_main:
+        log_path = os.path.join(config['output_dir'], 'train.log')
+        _log_file = open(log_path, 'a', buffering=1, encoding='utf-8')
+        sys.stdout = _TeeLogger(sys.__stdout__, _log_file)
+        sys.stderr = _TeeLogger(sys.__stderr__, _log_file)
+        print(f'Run dir : {config["output_dir"]}')
+        print(f'Log file: {log_path}')
+        if world_size > 1:
+            print(f'Distributed: {world_size} GPUs (rank {rank}, local_rank {local_rank})')
 
     # In test mode, force small epoch count and high log frequency
     if args.test or args.test_data:
@@ -545,6 +603,11 @@ def main():
     device = config['device']
     dtype = config['dtype']
 
+    # In multi-GPU mode, each rank uses its own GPU via local_rank
+    if world_size > 1:
+        device = f'cuda:{local_rank}'
+        config['device'] = device
+
     # Fail fast on broken CUDA runtime before starting WandB/retry loops.
     if str(device).startswith('cuda'):
         if not torch.cuda.is_available():
@@ -553,81 +616,92 @@ def main():
                 "Please fix NVIDIA driver/runtime first, then resume from checkpoint."
             )
             sys.exit(2)
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        print(f'GPU: {bold(gpu_name)} | VRAM: {cyan(f"{vram_total:.1f} GiB")} | PyTorch: {torch.__version__}')
+        gpu_name = torch.cuda.get_device_name(local_rank)
+        vram_total = torch.cuda.get_device_properties(local_rank).total_memory / (1024 ** 3)
+        if is_main:
+            print(f'GPU: {bold(gpu_name)} | VRAM: {cyan(f"{vram_total:.1f} GiB")} | PyTorch: {torch.__version__}')
     else:
-        print(f'GPU: {gray("CPU mode")} | PyTorch: {torch.__version__}')
+        if is_main:
+            print(f'GPU: {gray("CPU mode")} | PyTorch: {torch.__version__}')
 
-    # ── WandB init ──────────────────────────────────────────────────────────
+    # ── WandB init (rank 0 only) ──────────────────────────────────────────────
     mode = 'test' if (args.test or args.test_data) else 'train'
     _run_label = args.name if args.name else 'hdc2a'
-    try:
-        _wandb_kwargs = dict(
-            project=config['wandb_project'],
-            name=f'{_run_label}-{mode}-{time.strftime("%Y%m%d-%H%M%S")}',
-            config={k: str(v) for k, v in config.items()},
-            tags=[mode],
-            settings=wandb.Settings(
-                console='off',
-                x_disable_stats=True,
-            ),
-        )
-        # Only set entity when explicitly configured — empty means personal namespace
-        _wandb_entity = config.get('wandb_entity', '')
-        if _wandb_entity:
-            _wandb_kwargs['entity'] = _wandb_entity
-        run = wandb.init(**_wandb_kwargs)
-        config['_wandb_active'] = True
-    except Exception as _wandb_err:
-        print(f'\n{bold_yellow("WARNING: WandB init failed — training will continue without logging.")}')
-        print(f'  Error: {_wandb_err}')
-        print(f'  Fix: check WANDB_API_KEY permissions, or run with --no-wandb to silence this.\n')
+    if not is_main:
         os.environ['WANDB_MODE'] = 'disabled'
         wandb.init(mode='disabled')
         config['_wandb_active'] = False
+    else:
+        try:
+            _wandb_kwargs = dict(
+                project=config['wandb_project'],
+                name=f'{_run_label}-{mode}-{time.strftime("%Y%m%d-%H%M%S")}',
+                config={k: str(v) for k, v in config.items()},
+                tags=[mode],
+                settings=wandb.Settings(
+                    console='off',
+                    x_disable_stats=True,
+                ),
+            )
+            # Only set entity when explicitly configured — empty means personal namespace
+            _wandb_entity = config.get('wandb_entity', '')
+            if _wandb_entity:
+                _wandb_kwargs['entity'] = _wandb_entity
+            run = wandb.init(**_wandb_kwargs)
+            config['_wandb_active'] = True
+        except Exception as _wandb_err:
+            print(f'\n{bold_yellow("WARNING: WandB init failed — training will continue without logging.")}')
+            print(f'  Error: {_wandb_err}')
+            print(f'  Fix: check WANDB_API_KEY permissions, or run with --no-wandb to silence this.\n')
+            os.environ['WANDB_MODE'] = 'disabled'
+            wandb.init(mode='disabled')
+            config['_wandb_active'] = False
 
     # ── Print final resolved config ────────────────────────────────────────
-    print(f'\n{bold_cyan("Final Configuration:")}')
-    _SECTIONS = [
-        ('Paths', [
-            'transformer_path', 'vae_path', 'controlnet_path',
-            'dataset_dir', 'color_map_path', 'output_dir',
-            'text_encoder_path', 'precomputed_embeddings',
-        ]),
-        ('Model', [
-            'image_size', 'num_classes', 'control_in_dim', 'fusion_dim',
-            'num_fusion_blocks', 'num_heads', 'num_fourier_bands', 'boundary_threshold',
-        ]),
-        ('Training', [
-            'num_epochs', 'batch_size', 'learning_rate', 'weight_decay',
-            'max_grad_norm', 'grad_accum_steps', 'guidance_scale', 'num_workers',
-        ]),
-        ('Text Encoder', [
-            'text_seq_len', 'text_dim',
-        ]),
-        ('Logging', [
-            'log_interval', 'save_every_n_epochs', 'val_every_n_epochs',
-        ]),
-        ('WandB', [
-            'wandb_entity', 'wandb_project',
-        ]),
-        ('Resume', [
-            'resume_from',
-        ]),
-    ]
-    for section_name, keys in _SECTIONS:
-        print(f'  {bold(section_name)}:')
-        for k in keys:
-            v = config.get(k)
-            v_str = str(v) if v is not None else gray('(not set)')
-            print(f'    {k:<28s} {v_str}')
+    if is_main:
+        print(f'\n{bold_cyan("Final Configuration:")}')
+        _SECTIONS = [
+            ('Paths', [
+                'transformer_path', 'vae_path', 'controlnet_path',
+                'dataset_dir', 'color_map_path', 'output_dir',
+                'text_encoder_path', 'precomputed_embeddings',
+            ]),
+            ('Model', [
+                'image_size', 'num_classes', 'control_in_dim', 'fusion_dim',
+                'num_fusion_blocks', 'num_heads', 'num_fourier_bands', 'boundary_threshold',
+            ]),
+            ('Training', [
+                'num_epochs', 'batch_size', 'learning_rate', 'weight_decay',
+                'max_grad_norm', 'grad_accum_steps', 'guidance_scale', 'num_workers',
+            ]),
+            ('Text Encoder', [
+                'text_seq_len', 'text_dim',
+            ]),
+            ('Logging', [
+                'log_interval', 'save_every_n_epochs', 'val_every_n_epochs',
+            ]),
+            ('WandB', [
+                'wandb_entity', 'wandb_project',
+            ]),
+            ('Resume', [
+                'resume_from',
+            ]),
+        ]
+        for section_name, keys in _SECTIONS:
+            print(f'  {bold(section_name)}:')
+            for k in keys:
+                v = config.get(k)
+                v_str = str(v) if v is not None else gray('(not set)')
+                print(f'    {k:<28s} {v_str}')
 
     check_memory('pre-flight')
 
     # ── Pre-flight checks (skip for --test mode which uses random data) ─────
-    if not (args.test or args.test_data):
+    if not (args.test or args.test_data) and is_main:
         run_preflight_checks(config)
+    # Barrier: wait for rank 0 preflight before all ranks proceed
+    if world_size > 1:
+        dist.barrier()
 
     # ── Text Embeddings (precompute BEFORE loading transformer to save VRAM) ──
     phase('[1/8] Text Embeddings', config)
@@ -635,28 +709,34 @@ def main():
     precomp_path = config.get('precomputed_embeddings')
     if precomp_path and os.path.exists(precomp_path):
         # Reuse cached embedding
-        print(f'  Loading cached embedding from {precomp_path}')
+        if is_main:
+            print(f'  Loading cached embedding from {precomp_path}')
         embeddings_dict = load_precomputed_embeddings(precomp_path)
     elif config.get('text_encoder_path') and os.path.exists(config['text_encoder_path']):
-        # Build prompt string from prompt.json and encode once before loading transformer
-        prompt_json_path = os.path.join(config['dataset_dir'], 'prompt.json')
-        if not os.path.exists(prompt_json_path):
-            print(f'{bold_red("ERROR:")} prompt.json not found at {prompt_json_path}')
-            sys.exit(1)
-        prompt_text = compose_prompt_from_json(prompt_json_path)
-        print(f'  Composed prompt ({len(prompt_text)} chars):\n    {prompt_text[:160]}...')
-        save_path = precomp_path or os.path.join(config['output_dir'], 'text_embeddings_global.pt')
-        os.makedirs(config['output_dir'], exist_ok=True)
-        precompute_single_prompt_embeddings(
-            model_path=config['text_encoder_path'],
-            prompt_text=prompt_text,
-            output_path=save_path,
-            max_sequence_length=config['text_seq_len'],
-            device=device,
-            dtype=dtype,
-        )
-        embeddings_dict = load_precomputed_embeddings(save_path)
-        config['precomputed_embeddings'] = save_path
+        # Rank 0 encodes; other ranks wait, then all load from file
+        if is_main:
+            prompt_json_path = os.path.join(config['dataset_dir'], 'prompt.json')
+            if not os.path.exists(prompt_json_path):
+                print(f'{bold_red("ERROR:")} prompt.json not found at {prompt_json_path}')
+                sys.exit(1)
+            prompt_text = compose_prompt_from_json(prompt_json_path)
+            print(f'  Composed prompt ({len(prompt_text)} chars):\n    {prompt_text[:160]}...')
+            save_path = precomp_path or os.path.join(config['output_dir'], 'text_embeddings_global.pt')
+            os.makedirs(config['output_dir'], exist_ok=True)
+            precompute_single_prompt_embeddings(
+                model_path=config['text_encoder_path'],
+                prompt_text=prompt_text,
+                output_path=save_path,
+                max_sequence_length=config['text_seq_len'],
+                device=device,
+                dtype=dtype,
+            )
+            config['precomputed_embeddings'] = save_path
+        if world_size > 1:
+            dist.barrier()
+        # All ranks load from the saved file
+        _emb_path = config.get('precomputed_embeddings') or os.path.join(config['output_dir'], 'text_embeddings_global.pt')
+        embeddings_dict = load_precomputed_embeddings(_emb_path)
     else:
         # No text encoder and no precomputed embeddings — fail for real training
         if args.test or args.test_data:
@@ -715,20 +795,27 @@ def main():
     print(f'Control: {ctrl_params/1e6:.1f}M params')
     print(f'Total trainable: {total_trainable/1e6:.1f}M params')
 
-    # === OVERFIT TEST ===
-    # 过拟合模式下：给 ControlNet control_transformer_blocks 的 attention 层注入 LoRA。
-    # 原始权重完全冻结，只训 rank 很小的 A/B 矩阵，大幅减少可训练参数量，
-    # 同时保留足够的学习能力来过拟合几张图。
-    if config.get('_overfit_mode', False):
+    # === LoRA injection (--use-lora or --overfit) ===
+    # 给 ControlNet control_transformer_blocks 的 attention 层注入 LoRA。
+    # 原始权重完全冻结，只训 rank 很小的 A/B 矩阵，大幅减少可训练参数量。
+    _apply_lora = not getattr(args, 'no_lora', False) or config.get('_overfit_mode', False)
+    if _apply_lora:
         phase('[4.5/8] Applying LoRA to ControlNet Control Blocks', config)
         _lora_rank = getattr(args, 'lora_rank', 32)
-        _lora_alpha = getattr(args, 'lora_alpha', 32.0)
+        _lora_alpha = getattr(args, 'lora_alpha', None) or float(_lora_rank)
         print(f'  LoRA rank={_lora_rank}, alpha={_lora_alpha}, dropout=0')
         lora_modules = apply_lora_to_control_blocks(
             transformer, rank=_lora_rank, alpha=_lora_alpha,
         )
         print_param_stats(hdc2a, transformer, lora_modules)
-    # === END OVERFIT TEST ===
+    # === END LoRA ===
+
+    # ── DDP wrap HDC²A before optimizer ─────────────────────────────────────
+    # Transformer is NOT wrapped (mostly frozen; trainable params get manual gradient sync).
+    hdc2a_raw = hdc2a  # keep reference for checkpoint save/load
+    if world_size > 1:
+        hdc2a = DDP(hdc2a, device_ids=[local_rank])
+        print(f'  HDC²A wrapped in DDP (device_ids=[{local_rank}])')
 
     # ── Optimizer ───────────────────────────────────────────────────────────
     phase('[5/8] Building Optimizer', config)
@@ -781,7 +868,7 @@ def main():
         phase('[6/8] Resuming from Checkpoint', config)
         print(f'  Path: {config["resume_from"]}')
         _ckpt_info = load_checkpoint(
-            config['resume_from'], hdc2a, transformer, optimizer, device,
+            config['resume_from'], hdc2a_raw, transformer, optimizer, device,
             scheduler=scheduler)
         start_epoch = _ckpt_info['epoch'] + 1
         _resume_global_step = _ckpt_info.get('global_step', 0)
@@ -808,8 +895,10 @@ def main():
 
     # ── --test mode: exit after forward test ────────────────────────────────
     if args.test:
-        print(f'\n{bold_green("*** --test passed: all models loaded, forward test OK. Exiting. ***")}')
+        if is_main:
+            print(f'\n{bold_green("*** --test passed: all models loaded, forward test OK. Exiting. ***")}')
         wandb.finish()
+        cleanup_distributed()
         return
 
     # ── Data ────────────────────────────────────────────────────────────────
@@ -821,15 +910,17 @@ def main():
     _use_augment = False
     if not config.get('_overfit_mode', False):
         _use_augment = bool(args_dict.get('use_augment'))
-    if _use_augment:
-        print(f'[Data] {bold_cyan("Data augmentation: ENABLED")} '
-              f'(flips, rotations, scale-crop, colour jitter, blur, noise, cutout)')
-    else:
-        print(f'[Data] Data augmentation: disabled')
+    if is_main:
+        if _use_augment:
+            print(f'[Data] {bold_cyan("Data augmentation: ENABLED")} '
+                  f'(flips, rotations, scale-crop, colour jitter, blur, noise, cutout)')
+        else:
+            print(f'[Data] Data augmentation: disabled')
 
     # Always load test split for milestone visualization
     _overfit_mode = config.get('_overfit_mode', False)
     _aug = False if _overfit_mode else _use_augment
+    _distributed = (world_size > 1)
     train_loader, val_loader, test_loader = create_dataloaders(
         config['dataset_dir'],
         config['color_map_path'],
@@ -841,40 +932,50 @@ def main():
         shuffle_train=_shuffle_train,
         use_augment=_aug,
         include_test=True,
+        distributed=_distributed,
     )
 
     if train_loader is None:
-        print('\n[WARNING] No training data found. Pipeline verified successfully.')
-        print('Place your data in dataset/train/ (rgb/, seg/, depth/, captions.json) and re-run.')
-        print('Then set text_encoder_path to precompute text embeddings, or provide precomputed_embeddings.')
+        if is_main:
+            print('\n[WARNING] No training data found. Pipeline verified successfully.')
+            print('Place your data in dataset/train/ (rgb/, seg/, depth/, captions.json) and re-run.')
+            print('Then set text_encoder_path to precompute text embeddings, or provide precomputed_embeddings.')
         wandb.finish()
+        cleanup_distributed()
         return
 
     # ── --test-data mode: run 1 train step then exit ────────────────────────
     if args.test_data:
         if train_loader is None:
-            print('\n*** --test-data FAILED: no training data found. ***')
+            if is_main:
+                print('\n*** --test-data FAILED: no training data found. ***')
             wandb.finish()
+            cleanup_distributed()
             return
-        print('\n*** --test-data: running 1 training step... ***')
+        if is_main:
+            print('\n*** --test-data: running 1 training step... ***')
         train_loss, _ = train_one_epoch(
             0, hdc2a, transformer, vae, bn_mean, bn_std,
             train_loader, optimizer, None, config, scheduler=scheduler,
         )
-        print(f'*** --test-data passed: 1 epoch OK, loss={train_loss:.6f} ***')
+        if is_main:
+            print(f'*** --test-data passed: 1 epoch OK, loss={train_loss:.6f} ***')
         wandb.finish()
+        cleanup_distributed()
         return
 
     # ── Training Loop ───────────────────────────────────────────────────────
     total_epochs = config['num_epochs']
     total_steps = total_epochs * len(train_loader)
-    print(f'\n{bold("="*70)}')
-    print(bold(f'Starting training: {total_epochs} epochs × {len(train_loader)} steps = {total_steps} total steps'))
-    print(f'  batch_size={config["batch_size"]}, grad_accum={config["grad_accum_steps"]}, '
-          f'effective_bs={config["batch_size"] * config["grad_accum_steps"]}')
-    print(f'  adapter_lr={config.get("adapter_lr", config["learning_rate"]):.2e}, '
-          f'weight_decay={config["weight_decay"]}')
-    print(f'{bold("="*70)}')
+    if is_main:
+        _eff_bs = config['batch_size'] * config['grad_accum_steps'] * world_size
+        print(f'\n{bold("="*70)}')
+        print(bold(f'Starting training: {total_epochs} epochs × {len(train_loader)} steps = {total_steps} total steps'))
+        print(f'  batch_size={config["batch_size"]}, grad_accum={config["grad_accum_steps"]}, '
+              f'world_size={world_size}, effective_bs={_eff_bs}')
+        print(f'  adapter_lr={config.get("adapter_lr", config["learning_rate"]):.2e}, '
+              f'weight_decay={config["weight_decay"]}')
+        print(f'{bold("="*70)}')
 
     best_val_loss = _resume_best_val_loss
     best_ckpt_path = None
@@ -1018,15 +1119,22 @@ def main():
     # === END OVERFIT TEST ===
 
     for epoch in range(start_epoch, total_epochs):
+        # Distributed: set epoch on sampler for proper shuffling
+        if hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
+        if val_loader is not None and hasattr(val_loader.sampler, 'set_epoch'):
+            val_loader.sampler.set_epoch(epoch)
+
         epoch_start = time.time()
         epoch_progress = (epoch - start_epoch) / max(total_epochs - start_epoch, 1) * 100
 
         # Train
-        print(f'\n--- {bold_magenta(f"Epoch {epoch}/{total_epochs-1}")}  ({bold_cyan(f"{epoch_progress:.0f}%")} done) ---')
+        if is_main:
+            print(f'\n--- {bold_magenta(f"Epoch {epoch}/{total_epochs-1}")}  ({bold_cyan(f"{epoch_progress:.0f}%")} done) ---')
         train_loss, _epoch_opt_steps = train_one_epoch(
             epoch, hdc2a, transformer, vae, bn_mean, bn_std,
             train_loader, optimizer, None, config, scheduler=scheduler,
-            step_vis_callback=_active_step_vis_callback,
+            step_vis_callback=_active_step_vis_callback if is_main else None,
             step_vis_interval=1,   # callback checks internally; pass every step
         )
         epoch_time = time.time() - epoch_start
@@ -1034,8 +1142,9 @@ def main():
         epochs_done = epoch - start_epoch + 1
         eta = elapsed / epochs_done * (total_epochs - start_epoch - epochs_done)
         _cumulative_opt_steps += _epoch_opt_steps
-        print(f'  Train loss: {yellow(f"{train_loss:.6f}")} ({epoch_time:.1f}s)  '
-              f'ETA: {cyan(f"{eta/60:.0f}min")}')
+        if is_main:
+            print(f'  Train loss: {yellow(f"{train_loss:.6f}")} ({epoch_time:.1f}s)  '
+                  f'ETA: {cyan(f"{eta/60:.0f}min")}')
         _train_losses.append((epoch, train_loss))
 
         wandb.log({
@@ -1054,48 +1163,56 @@ def main():
                 val_loader, config,
             )
             # Print overall + per-bin losses
-            _bin_str = '  '.join(f'{k}={v:.4f}' for k, v in _val_t_bins.items())
-            print(f'  Val loss: {val_loss:.6f}  [{_bin_str}]')
+            if is_main:
+                _bin_str = '  '.join(f'{k}={v:.4f}' for k, v in _val_t_bins.items())
+                print(f'  Val loss: {val_loss:.6f}  [{_bin_str}]')
             _wandb_val = {"val_loss": val_loss}
             _wandb_val.update({f'val/{k}': v for k, v in _val_t_bins.items()})
             wandb.log(_wandb_val)
 
-            # save_checkpoint handles best tracking + rotation internally
-            _, _, best_val_loss, best_ckpt_path = save_checkpoint(
-                epoch, hdc2a, transformer, optimizer,
-                val_loss, config['output_dir'], config,
-                keep_last_n=keep_last_n,
-                best_loss=best_val_loss,
-                best_ckpt_path=best_ckpt_path,
-                scheduler=scheduler,
-                global_step=_cumulative_opt_steps,
-            )
-
-        # Periodic checkpoint (even when no val this epoch)
-        elif (epoch + 1) % config['save_every_n_epochs'] == 0:
-            # === OVERFIT TEST === 过拟合模式用轻量 LoRA checkpoint（只保存 A/B + adapter）
-            if _overfit_mode and lora_modules:
-                save_lora_checkpoint(
-                    epoch, hdc2a, lora_modules, config['output_dir'], loss=train_loss,
-                )
-            else:
-                # === END OVERFIT TEST ===
+            # save_checkpoint handles best tracking + rotation internally (rank 0 only)
+            if is_main:
                 _, _, best_val_loss, best_ckpt_path = save_checkpoint(
-                    epoch, hdc2a, transformer, optimizer,
-                    train_loss, config['output_dir'], config,
+                    epoch, hdc2a_raw, transformer, optimizer,
+                    val_loss, config['output_dir'], config,
                     keep_last_n=keep_last_n,
                     best_loss=best_val_loss,
                     best_ckpt_path=best_ckpt_path,
                     scheduler=scheduler,
                     global_step=_cumulative_opt_steps,
                 )
+            if world_size > 1:
+                dist.barrier()
+
+        # Periodic checkpoint (even when no val this epoch)
+        elif (epoch + 1) % config['save_every_n_epochs'] == 0:
+            # === OVERFIT TEST === 过拟合模式用轻量 LoRA checkpoint（只保存 A/B + adapter）
+            if _overfit_mode and lora_modules:
+                if is_main:
+                    save_lora_checkpoint(
+                        epoch, hdc2a_raw, lora_modules, config['output_dir'], loss=train_loss,
+                    )
+            else:
+                # === END OVERFIT TEST ===
+                if is_main:
+                    _, _, best_val_loss, best_ckpt_path = save_checkpoint(
+                        epoch, hdc2a_raw, transformer, optimizer,
+                        train_loss, config['output_dir'], config,
+                        keep_last_n=keep_last_n,
+                        best_loss=best_val_loss,
+                        best_ckpt_path=best_ckpt_path,
+                        scheduler=scheduler,
+                        global_step=_cumulative_opt_steps,
+                    )
+            if world_size > 1:
+                dist.barrier()
 
         check_memory(f'epoch {epoch} end')
 
     # ── Post-training: loss curve ────────────────────────────────────────────
     # (milestone big grids are already saved at each checkpoint above)
-    # Loss curve PNG (always saved)
-    if _train_losses:
+    # Loss curve PNG (always saved, rank 0 only)
+    if _train_losses and is_main:
         try:
             import matplotlib
             matplotlib.use('Agg')
@@ -1121,9 +1238,10 @@ def main():
             print(f'  {bold_yellow("[LossCurve WARN]")} could not save loss curve: {_e}')
 
     # ── Cleanup ─────────────────────────────────────────────────────────────
-    print(f'\n{"="*70}')
-    print('Training complete.')
-    print(f'{"="*70}')
+    if is_main:
+        print(f'\n{"="*70}')
+        print('Training complete.')
+        print(f'{"="*70}')
 
     wandb.summary.update({
         "final_train_loss": train_loss,
@@ -1131,6 +1249,7 @@ def main():
         "total_epochs": config['num_epochs'],
     })
     wandb.finish()
+    cleanup_distributed()
 
 
 if __name__ == '__main__':
