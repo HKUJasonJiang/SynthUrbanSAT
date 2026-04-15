@@ -13,6 +13,9 @@ sudo apt update && sudo apt install -y git tmux
 ```bash
 git clone https://github.com/HKUJasonJiang/SynthUrbanSAT.git
 cd SynthUrbanSAT
+chmod +x setup.sh
+chmod +x run_train.sh
+chmod +x upload.sh
 ```
 
 ## 3. Configure HF Tokens
@@ -116,6 +119,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
     --name lora_baseline_4A100_main \
     --batch-size 3 \
     --adapter-lr 8e-4 \
+    --hf-repo JasonXF/SynthUrbanSAT-Output \
     --seed 42
 '
 
@@ -129,6 +133,7 @@ CUDA_VISIBLE_DEVICES=4,5 \
     --name abl_seg_only_2A100 \
     --batch-size 3 \
     --disable-depth \
+    --hf-repo JasonXF/SynthUrbanSAT-Output \
     --seed 42
 '
 
@@ -139,6 +144,7 @@ CUDA_VISIBLE_DEVICES=6 python train_script.py \
     --name lora_rank_256_1A100 \
     --batch-size 3 \
     --lora-rank 256 \
+    --hf-repo JasonXF/SynthUrbanSAT-Output \
     --seed 42
 '
 
@@ -149,6 +155,7 @@ CUDA_VISIBLE_DEVICES=7 python train_script.py \
     --name abl_time_1A100 \
     --batch-size 3 \
     --no-minsnr \
+    --hf-repo JasonXF/SynthUrbanSAT-Output \
     --seed 42
 '
 ```
@@ -180,9 +187,9 @@ tmux kill-server              # kill ALL tmux sessions at once (nuclear option)
 > - Only rank 0 saves checkpoints and logs to WandB.
 > - LR linear scaling: when using N GPUs, multiply base LR by N (e.g. 3e-4 × 4 = 1.2e-3).
 
-## 7. (Optional) Push Results to HuggingFace
+## 7. (optional) Push Results to HuggingFace
 
-Upload a specific experiment's output folder:
+Theoretically, the upload will precess automatically. In case of failure, here are the manual script that uploads a specific experiment's output folder:
 
 ```bash
 bash upload.sh --name lora_baseline_4A100_main       # upload output/lora_baseline_4A100_main/

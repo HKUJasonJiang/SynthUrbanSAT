@@ -341,6 +341,11 @@ def parse_args():
     p.add_argument('--lora-alpha', type=float, default=None,
                    help='LoRA alpha (default: same as --lora-rank).')
 
+    # ── Auto-upload to HuggingFace ──
+    p.add_argument('--hf-repo', type=str, default=None,
+                   help='HuggingFace repo ID for auto-upload at each milestone '
+                        '(e.g. JasonXF/SynthUrbanSAT-Output). Disabled if not set.')
+
     # === OVERFIT TEST ===
     p.add_argument('--overfit', action='store_true',
                    help=('过拟合 sanity check 模式。自动使用 dataset_small，'
@@ -1109,6 +1114,25 @@ def main():
             except Exception as _e:
                 print(f'  {bold_yellow("[MilestoneVis WARN]")} {grid_label} step {global_step}: {_e}')
 
+        # ── Auto-upload to HuggingFace (overwrites previous upload) ────────
+        _hf_repo = args.hf_repo
+        if _hf_repo:
+            try:
+                from upload import upload_to_hf
+                _hf_path = f'output/{args.name}'
+                # Exclude checkpoint dirs and .pt files (large); upload vis + logs only
+                _ignore = ['checkpoint_*/**', '*.pt', 'wandb/**']
+                print(f'  {bold_cyan("[HF Upload]")} syncing to {_hf_repo}/{_hf_path} ...')
+                _hf_url = upload_to_hf(
+                    local_dir=config['output_dir'],
+                    repo=_hf_repo,
+                    path_in_repo=_hf_path,
+                    ignore_patterns=_ignore,
+                )
+                print(f'  {bold_green("[HF Upload]")} ✓ {_hf_url}')
+            except Exception as _hf_err:
+                print(f'  {bold_yellow("[HF Upload WARN]")} upload failed: {_hf_err}')
+
     # Callback for the train loop: fires only at milestone steps
     def _milestone_step_callback(_global_step, _batch):
         if _global_step in _milestone_set:
@@ -1236,6 +1260,23 @@ def main():
                 pass
         except Exception as _e:
             print(f'  {bold_yellow("[LossCurve WARN]")} could not save loss curve: {_e}')
+
+    # ── Final HF upload (after loss curve is saved) ───────────────────────
+    if is_main and args.hf_repo:
+        try:
+            from upload import upload_to_hf
+            _hf_path = f'output/{args.name}'
+            _ignore = ['checkpoint_*/**', '*.pt', 'wandb/**']
+            print(f'  {bold_cyan("[HF Upload]")} final sync to {args.hf_repo}/{_hf_path} ...')
+            _hf_url = upload_to_hf(
+                local_dir=config['output_dir'],
+                repo=args.hf_repo,
+                path_in_repo=_hf_path,
+                ignore_patterns=_ignore,
+            )
+            print(f'  {bold_green("[HF Upload]")} ✓ {_hf_url}')
+        except Exception as _hf_err:
+            print(f'  {bold_yellow("[HF Upload WARN]")} final upload failed: {_hf_err}')
 
     # ── Cleanup ─────────────────────────────────────────────────────────────
     if is_main:
