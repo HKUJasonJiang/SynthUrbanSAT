@@ -164,9 +164,8 @@ CONFIG = {
     # ── Training ──
     'num_epochs': 500,
     'batch_size': 4,            # lora=4, controlnet=1
-    'learning_rate': 6e-4,      # Adapter-only run: larger LR safe with only 52M params
     'adapter_lr': 1e-3,         # HDC²A adapter learning rate
-    'backbone_lr': 0.0,         # ControlNet backbone LR (0 = completely frozen)
+    'lora_lr': 1e-4,            # LoRA learning rate (0 = LoRA not trained)
     'weight_decay': 0.01,
     'max_grad_norm': 1.0,
     'grad_accum_steps': 4,      # effective batch size = batch_size × grad_accum_steps
@@ -175,7 +174,7 @@ CONFIG = {
 
     # ── Training mode ──
     # True  = only train 52M HDC²A adapter (recommended for ≤2000 samples)
-    # False = also fine-tune 4B ControlNet backbone (set backbone_lr > 0)
+    # False = also fine-tune 4B ControlNet backbone (set lora_lr > 0)
     'freeze_controlnet_backbone': True,
 
     # ── LR scheduler ──
@@ -229,7 +228,7 @@ OVERFIT_DEFAULTS = {
     'batch_size':              5,           # 全部 5 张图一次过（显存够的话）
     # ── 学习率：过拟合不需要小 lr，但也别太大 ──
     'adapter_lr':              1e-4,        # HDC²A adapter LR
-    'backbone_lr':             1e-4,        # LoRA LR（backbone_lr>0 → optimizer 会加 LoRA group）
+    'lora_lr':                 1e-4,        # LoRA LR（lora_lr>0 → optimizer 会加 LoRA group）
     'weight_decay':            0.0,         # 过拟合测试不需要正则化
     # ── LR scheduler：固定 LR，不用 cosine/warmup ──
     'lr_scheduler':            'constant',
@@ -283,7 +282,6 @@ def parse_args():
     # ── Training ──
     p.add_argument('--num-epochs', type=int, default=None)
     p.add_argument('--batch-size', type=int, default=None)
-    p.add_argument('--lr', '--learning-rate', type=float, default=None)
     p.add_argument('--weight-decay', type=float, default=None)
     p.add_argument('--max-grad-norm', type=float, default=None)
     p.add_argument('--grad-accum-steps', type=int, default=None)
@@ -312,11 +310,11 @@ def parse_args():
                              default=None,
                              help='Freeze ControlNet backbone, train only HDC\u00b2A (52M). Default in CONFIG.')
     _freeze_grp.add_argument('--unfreeze-backbone', dest='freeze_backbone', action='store_false',
-                             help='Unfreeze ControlNet backbone (set --backbone-lr too).')
+                             help='Unfreeze ControlNet backbone (set --lora-lr too).')
     p.add_argument('--adapter-lr', type=float, default=None,
                    help='Learning rate for HDC\u00b2A adapter (default: 3e-4).')
-    p.add_argument('--backbone-lr', type=float, default=None,
-                   help='Learning rate for ControlNet backbone when unfrozen (e.g. 1e-5).')
+    p.add_argument('--lora-lr', type=float, default=None,
+                   help='Learning rate for LoRA parameters (default: 0, not trained).')
 
     # ── Data augmentation ──
     _aug_grp = p.add_mutually_exclusive_group()
@@ -339,6 +337,11 @@ def parse_args():
                    help='Disable min-SNR loss weighting; use uniform weight w=1.')
 
     # ── LoRA (enabled by default, disable with --no-lora) ──
+    # ── Adapter fusion mode ──
+    p.add_argument('--adapter-mlp', action='store_true',
+                   help='Use lightweight MLP fusion instead of DoubleStream attention '
+                        'in HDC²A. Fewer params, faster; good for small datasets.')
+
     p.add_argument('--no-lora', action='store_true',
                    help='Disable LoRA injection (by default LoRA is ON with rank=32).')
     p.add_argument('--lora-rank', type=int, default=32,
@@ -552,7 +555,7 @@ def main():
         'boundary_threshold': 'boundary_threshold',
         'num_epochs': 'num_epochs',
         'batch_size': 'batch_size',
-        'lr': 'learning_rate',
+
         'weight_decay': 'weight_decay',
         'max_grad_norm': 'max_grad_norm',
         'grad_accum_steps': 'grad_accum_steps',
@@ -566,7 +569,7 @@ def main():
         'wandb_entity': 'wandb_entity',
         'wandb_project': 'wandb_project',
         'adapter_lr': 'adapter_lr',
-        'backbone_lr': 'backbone_lr',
+        'lora_lr': 'lora_lr',
         'milestone_pct': 'milestone_pct',
     }
     args_dict = vars(args)
@@ -690,7 +693,7 @@ def main():
                 'num_fusion_blocks', 'num_heads', 'num_fourier_bands', 'boundary_threshold',
             ]),
             ('Training', [
-                'num_epochs', 'batch_size', 'learning_rate', 'weight_decay',
+                'num_epochs', 'batch_size', 'adapter_lr', 'lora_lr', 'weight_decay',
                 'max_grad_norm', 'grad_accum_steps', 'guidance_scale', 'num_workers',
             ]),
             ('Text Encoder', [
@@ -796,6 +799,7 @@ def main():
 
     # ── Create HDC²A Adapter ────────────────────────────────────────────────
     phase('[4/8] Creating HDC²A Adapter', config)
+    _use_mlp_fusion = getattr(args, 'adapter_mlp', False)
     hdc2a = HDC2AAdapter(
         num_classes=config['num_classes'],
         fusion_dim=config['fusion_dim'],
@@ -805,7 +809,10 @@ def main():
         num_fourier_bands=config['num_fourier_bands'],
         boundary_threshold=config['boundary_threshold'],
         image_size=config['image_size'],
+        use_mlp_fusion=_use_mlp_fusion,
     ).to(device, dtype)
+    if _use_mlp_fusion:
+        print(f'  Fusion mode: MLP (lightweight)')
 
     hdc2a_params = sum(p.numel() for p in hdc2a.parameters())
     ctrl_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
@@ -839,21 +846,18 @@ def main():
     # ── Optimizer ───────────────────────────────────────────────────────────
     phase('[5/8] Building Optimizer', config)
 
-    # Separate param groups: HDC2A adapter (trainable) vs controlnet backbone
-    adapter_lr = config.get('adapter_lr', config['learning_rate'])
-    backbone_lr = config.get('backbone_lr', 0.0)
+    # Separate param groups: HDC²A adapter vs LoRA
+    adapter_lr = config['adapter_lr']
+    lora_lr = config.get('lora_lr', 0.0)
     param_groups = [{'params': list(hdc2a.parameters()), 'lr': adapter_lr, 'name': 'adapter'}]
     ctrl_trainable = [p for p in transformer.parameters() if p.requires_grad]
-    if backbone_lr > 0 and ctrl_trainable:
-        # === OVERFIT TEST === 过拟合模式下，ctrl_trainable 实际上是 LoRA A/B 参数
-        _pg_name = 'lora' if config.get('_overfit_mode', False) else 'backbone'
-        param_groups.append({'params': ctrl_trainable, 'lr': backbone_lr, 'name': _pg_name})
-        # === END OVERFIT TEST ===
+    if lora_lr > 0 and ctrl_trainable:
+        param_groups.append({'params': ctrl_trainable, 'lr': lora_lr, 'name': 'lora'})
     elif not ctrl_trainable:
         print('  Note: transformer has no requires_grad params (backbone fully frozen)')
 
     optimizer = torch.optim.AdamW(param_groups, weight_decay=config['weight_decay'])
-    print(f'  AdamW: adapter_lr={adapter_lr:.2e}, backbone_lr={backbone_lr:.2e}')
+    print(f'  AdamW: adapter_lr={adapter_lr:.2e}, lora_lr={lora_lr:.2e}')
     for pg in optimizer.param_groups:
         print(f"    param_group '{pg['name']}': {len(pg['params'])} tensors, lr={pg['lr']:.2e}")
 
@@ -992,7 +996,8 @@ def main():
         print(bold(f'Starting training: {total_epochs} epochs × {len(train_loader)} steps = {total_steps} total steps'))
         print(f'  batch_size={config["batch_size"]}, grad_accum={config["grad_accum_steps"]}, '
               f'world_size={world_size}, effective_bs={_eff_bs}')
-        print(f'  adapter_lr={config.get("adapter_lr", config["learning_rate"]):.2e}, '
+        print(f'  adapter_lr={config["adapter_lr"]:.2e}, '
+              f'lora_lr={config.get("lora_lr", 0.0):.2e}, '
               f'weight_decay={config["weight_decay"]}')
         print(f'{bold("="*70)}')
 
