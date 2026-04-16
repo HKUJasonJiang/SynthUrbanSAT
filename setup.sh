@@ -437,7 +437,6 @@ if [[ "$_NUM_GPUS" -ge 8 ]]; then
 else
     warn "Only ${_NUM_GPUS} GPU(s) — run.sh will skip experiments needing more GPUs"
     echo ""
-    echo "    bash run_train.sh     # single experiment"
-    echo "    bash run.sh           # launch experiments that fit"
+    echo "    bash run.sh           # launch experiments that fit this machine"
     echo ""
 fi

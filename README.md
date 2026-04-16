@@ -31,31 +31,31 @@ watch -n 1 nvidia-smi          # GPU utilization
 ### Single-GPU vs Multi-GPU
 
 ```bash
-# Single GPU (default)
-bash run_train.sh
+# Single GPU machine: run.sh will only launch experiments that fit
+bash run.sh
 
-# Multi-GPU DDP — just set GPUS
-GPUS=0,1,2,3 bash run_train.sh
+# 8-GPU machine: run.sh launches all 4 experiments concurrently
+bash run.sh
 ```
 
 ### Test Without Training
 
 ```bash
-bash run_train.sh --test --no-wandb        # smoke test (random data)
-bash run_train.sh --test-data --no-wandb   # 1 epoch with real data
+python train_script.py --test --name smoke_single --no-wandb
+python train_script.py --test-data --name smoke_data --no-wandb
 ```
 
 ### Override Hyperparameters
 
 ```bash
-bash run_train.sh --lr 5e-6 --batch-size 3 --num-epochs 200 --lora-rank 256
-bash run_train.sh --milestone-pct 5        # save milestone vis every 5% (default: 10%)
+python train_script.py --name custom_run --batch-size 3 --num-epochs 200 --lora-rank 256
+python train_script.py --name custom_run --milestone-pct 5   # every 5% (default: 10%)
 ```
 
 ### Resume from Checkpoint
 
 ```bash
-bash run_train.sh --resume output/checkpoint_epoch_0010
+python train_script.py --name resumed_run --resume output/checkpoint_epoch_0010
 ```
 
 ---
@@ -131,10 +131,8 @@ tmux new-session -d -s exp4 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=7 \
 
 ```
 ├── run.sh              ← Launch all 4 experiments in tmux (one click)
-├── run_train.sh        ← Single experiment config (hyperparams, GPU selection)
 ├── setup.sh            ← One-click environment setup
 ├── train_script.py     ← Training entry point
-├── upload.sh           ← Push results to HuggingFace
 ├── scripts/            ← Training modules (models, data, utils)
 ├── docs/
 │   ├── setup_server.md     ← Server deployment, tmux workflow, multi-GPU details
