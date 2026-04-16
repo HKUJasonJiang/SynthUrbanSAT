@@ -71,9 +71,6 @@ All 4 experiments run concurrently via tmux on different GPUs:
 | 3 | `lora_rank_256_1A100` | 6 | 3 | 12 | `--lora-rank 256` |
 | 4 | `abl_time_1A100` | 7 | 3 | 12 | `--no-minsnr` |
 
-<details>
-<summary>Launch commands (copy-paste)</summary>
-
 ```bash
 # Exp 1: Main baseline, 4×A100
 tmux new-session -d -s exp1 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=0,1,2,3 ~/miniconda/envs/flux_train/bin/torchrun --nproc_per_node=4 --master_port=29500 train_script.py --name lora_baseline_4A100_main --batch-size 12 --adapter-lr 8e-4 --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
@@ -87,8 +84,6 @@ tmux new-session -d -s exp3 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=6 ~/mini
 # Exp 4: Uniform timestep weight, 1×A100
 tmux new-session -d -s exp4 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=7 ~/miniconda/envs/flux_train/bin/python train_script.py --name abl_time_1A100 --batch-size 3 --no-minsnr --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
 ```
-
-</details>
 
 ### GPU VRAM Reference
 

@@ -177,7 +177,7 @@ for exp in "${EXPERIMENTS[@]}"; do
     if [[ "$NPROC" -gt 1 ]]; then
         CMD="cd $SCRIPT_DIR && source $SCRIPT_DIR/.env && CUDA_VISIBLE_DEVICES=$GPUS $TORCHRUN --nproc_per_node=$NPROC --master_port=$PORT train_script.py $TRAIN_ARGS"
     else
-        CMD="cd $SCRIPT_DIR && source $SCRIPT_DIR/.env && CUDA_VISIBLE_DEVICES=$GPUS $PYTHON -u train_script.py $TRAIN_ARGS"
+        CMD="cd $SCRIPT_DIR && source $SCRIPT_DIR/.env && CUDA_VISIBLE_DEVICES=$GPUS $PYTHON train_script.py $TRAIN_ARGS"
     fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
