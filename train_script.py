@@ -612,6 +612,9 @@ def main():
         _log_file = open(log_path, 'a', buffering=1, encoding='utf-8')
         sys.stdout = _TeeLogger(sys.__stdout__, _log_file)
         sys.stderr = _TeeLogger(sys.__stderr__, _log_file)
+        print(f'\n{bold("="*70)}')
+        print(f'{bold_cyan("Command:")} {" ".join(sys.argv)}')
+        print(f'{bold("="*70)}')
         print(f'Run dir : {config["output_dir"]}')
         print(f'Log file: {log_path}')
         if world_size > 1:
@@ -681,6 +684,23 @@ def main():
 
     # ── Print final resolved config ────────────────────────────────────────
     if is_main:
+        # Run summary: key flags at a glance
+        _fusion_mode = 'MLP (lightweight)' if getattr(args, 'adapter_mlp', False) else 'DoubleStream Attention'
+        _lora_status = 'OFF' if getattr(args, 'no_lora', False) else f'ON (rank={getattr(args, "lora_rank", 32)})'
+        _depth_status = 'DISABLED (seg-only ablation)' if getattr(args, 'disable_depth', False) else 'enabled'
+        _minsnr_status = 'OFF (uniform weight)' if getattr(args, 'no_minsnr', False) else 'ON'
+        _augment_status = 'ON' if args_dict.get('use_augment') else 'OFF'
+        print(f'\n{bold_cyan("Run Summary:")}')
+        print(f'  {"name":<20s} {bold(args.name)}')
+        print(f'  {"fusion":<20s} {_fusion_mode}')
+        print(f'  {"LoRA":<20s} {_lora_status}')
+        print(f'  {"depth input":<20s} {_depth_status}')
+        print(f'  {"min-SNR weighting":<20s} {_minsnr_status}')
+        print(f'  {"data augmentation":<20s} {_augment_status}')
+        print(f'  {"adapter_lr":<20s} {config["adapter_lr"]}')
+        print(f'  {"lora_lr":<20s} {config.get("lora_lr", 0.0)}')
+        print(f'  {"overfit mode":<20s} {config.get("_overfit_mode", False)}')
+
         print(f'\n{bold_cyan("Final Configuration:")}')
         _SECTIONS = [
             ('Paths', [
