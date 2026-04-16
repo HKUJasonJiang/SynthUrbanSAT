@@ -421,7 +421,23 @@ fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 header "Setup Complete"
-ok "Environment ready. Start training with:"
+ok "Environment ready."
 echo ""
-echo "    bash run_train.sh"
+
+# ── GPU Summary ──────────────────────────────────────────────────────────────
+_NUM_GPUS=$("$PYTHON" -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo 0)
+_GPU_NAME=$("$PYTHON" -c "import torch; print(torch.cuda.get_device_name(0))" 2>/dev/null || echo "unknown")
+echo -e "${BOLD}  Machine: ${_NUM_GPUS}× ${_GPU_NAME}${RESET}"
 echo ""
+if [[ "$_NUM_GPUS" -ge 8 ]]; then
+    ok "8+ GPUs detected — ready for full experiment plan (4 experiments)"
+    echo ""
+    echo "    bash run.sh           # launch all 4 experiments in tmux"
+    echo ""
+else
+    warn "Only ${_NUM_GPUS} GPU(s) — run.sh will skip experiments needing more GPUs"
+    echo ""
+    echo "    bash run_train.sh     # single experiment"
+    echo "    bash run.sh           # launch experiments that fit"
+    echo ""
+fi

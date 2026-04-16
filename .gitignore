@@ -37,3 +37,6 @@ _upload_remaining.py
 
 # Other (analysis notebooks, scratch files)
 other/
+
+# Version file backups
+scripts/version_file/

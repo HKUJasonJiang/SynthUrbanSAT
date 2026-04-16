@@ -17,14 +17,16 @@ cp .env.example .env          # fill in HF_TOKEN_READ, HF_TOKEN_WRITE, WANDB_API
 # 2. One-click setup (installs env + downloads data & weights + smoke test)
 bash setup.sh --test-both 0,1,2,3
 
-# 3. Train (edit run_train.sh to set NAME, GPUS, hyperparams)
-bash run_train.sh
+# 3. Launch all 4 experiments (auto WandB + auto HF upload)
+bash run.sh
 
-# 4. Upload results (auto-upload is enabled by default; manual fallback below)
-bash upload.sh --name <NAME>
+# 4. Monitor
+tmux ls                        # list running experiments
+tmux attach -t exp1            # attach to exp1 (Ctrl-B D to detach)
+watch -n 1 nvidia-smi          # GPU utilization
 ```
 
-> **tmux recommended** — wrap long-running commands in `tmux new-session -s <name> '...'` so they survive SSH disconnects. See [docs/setup_server.md](docs/setup_server.md) for tmux tips.
+> `setup.sh` will print the GPU summary at the end (e.g. "8× NVIDIA A100 80GB"). If all checks are green, just `bash run.sh`.
 
 ### Single-GPU vs Multi-GPU
 
@@ -128,7 +130,8 @@ tmux new-session -d -s exp4 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=7 \
 ## Project Structure
 
 ```
-├── run_train.sh        ← Hyperparameters & launch config (edit this)
+├── run.sh              ← Launch all 4 experiments in tmux (one click)
+├── run_train.sh        ← Single experiment config (hyperparams, GPU selection)
 ├── setup.sh            ← One-click environment setup
 ├── train_script.py     ← Training entry point
 ├── upload.sh           ← Push results to HuggingFace
