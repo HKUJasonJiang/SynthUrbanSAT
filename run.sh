@@ -136,17 +136,17 @@ set +a
 # Format: session_name | gpus | nproc | master_port | train_args
 # Note: keep these 4 experiments aligned with README / setup_server plan.
 declare -a EXPERIMENTS=(
-    # Exp 1: Main baseline, 4×A100
-    "exp1|0,1,2,3|4|29500|--name lora_baseline_4A100_main --batch-size 12 --adapter-lr 8e-4 --hf-repo ${HF_REPO} --seed ${SEED}"
+    # Exp 1: Main baseline, MLP, 4×A100
+    "exp1|0,1,2,3|4|29500|--name lora_baseline_mlp_4A100_main --adapter-lr 8e-3 --lora-lr 2e-4 --adapter-mlp --batch-size 12 --hf-repo ${HF_REPO} --seed ${SEED}"
 
-    # Exp 2: Seg-only ablation, 2×A100
-    "exp2|4,5|2|29501|--name abl_seg_only_2A100 --batch-size 6 --disable-depth --hf-repo ${HF_REPO} --seed ${SEED}"
+    # Exp 2: Seg-only ablation, MLP, 2×A100
+    "exp2|4,5|2|29501|--name abl_seg_only_mlp_2A100 --batch-size 6 --disable-depth --adapter-lr 3e-3 --lora-lr 2e-4 --adapter-mlp --hf-repo ${HF_REPO} --seed ${SEED}"
 
-    # Exp 3: LoRA rank 256, 1×A100
-    "exp3|6|1|0|--name lora_rank_256_1A100 --batch-size 3 --lora-rank 256 --hf-repo ${HF_REPO} --seed ${SEED}"
+    # Exp 3: LoRA rank 256, MLP, 1×A100
+    "exp3|6|1|0|--name lora_rank_256_mlp_1A100 --batch-size 3 --adapter-lr 1e-3 --lora-lr 1e-4 --adapter-mlp --lora-rank 256 --hf-repo ${HF_REPO} --seed ${SEED}"
 
-    # Exp 4: Uniform timestep weight, 1×A100
-    "exp4|7|1|0|--name abl_time_1A100 --batch-size 3 --no-minsnr --hf-repo ${HF_REPO} --seed ${SEED}"
+    # Exp 4: Uniform timestep weight, MLP, 1×A100
+    "exp4|7|1|0|--name abl_time_mlp_1A100 --batch-size 3 --adapter-lr 1e-3 --lora-lr 1e-4 --adapter-mlp --no-minsnr --hf-repo ${HF_REPO} --seed ${SEED}"
 )
 
 # ── Launch ───────────────────────────────────────────────────────────────────
