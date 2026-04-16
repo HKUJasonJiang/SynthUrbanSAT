@@ -27,6 +27,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ── CUDA library path (needed when conda env doesn't expose libcuda.so) ──────
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
 # ── Config ───────────────────────────────────────────────────────────────────
 CONDA_BASE="${CONDA_BASE:-$HOME/miniconda}"
 ENV_NAME="flux_train"

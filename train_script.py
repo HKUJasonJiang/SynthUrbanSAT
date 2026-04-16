@@ -1126,7 +1126,7 @@ def main():
         _hf_repo = args.hf_repo
         if _hf_repo:
             try:
-                from upload import upload_to_hf
+                from ControlNet_training.HDC2A_training.scripts.version_file.upload import upload_to_hf
                 _hf_path = f'output/{args.name}'
                 # Exclude checkpoint dirs and .pt files (large); upload vis + logs only
                 _ignore = ['checkpoint_*/**', '*.pt', 'wandb/**']
@@ -1272,7 +1272,7 @@ def main():
     # ── Final HF upload (after loss curve is saved) ───────────────────────
     if is_main and args.hf_repo:
         try:
-            from upload import upload_to_hf
+            from ControlNet_training.HDC2A_training.scripts.version_file.upload import upload_to_hf
             _hf_path = f'output/{args.name}'
             _ignore = ['checkpoint_*/**', '*.pt', 'wandb/**']
             print(f'  {bold_cyan("[HF Upload]")} final sync to {args.hf_repo}/{_hf_path} ...')
