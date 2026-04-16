@@ -71,17 +71,27 @@ All 4 experiments run concurrently via tmux on different GPUs:
 | 3 | `lora_rank_256_1A100` | 6 | 3 | 12 | `--lora-rank 256` |
 | 4 | `abl_time_1A100` | 7 | 3 | 12 | `--no-minsnr` |
 
+### Exp 1: Main baseline, 4×A100
+
 ```bash
-# Exp 1: Main baseline, 4×A100
 tmux new-session -d -s exp1 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=0,1,2,3 ~/miniconda/envs/flux_train/bin/torchrun --nproc_per_node=4 --master_port=29500 train_script.py --name lora_baseline_4A100_main --batch-size 12 --adapter-lr 8e-4 --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
+```
 
-# Exp 2: Seg-only ablation, 2×A100
+### Exp 2: Seg-only ablation, 2×A100
+
+```bash
 tmux new-session -d -s exp2 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=4,5 ~/miniconda/envs/flux_train/bin/torchrun --nproc_per_node=2 --master_port=29501 train_script.py --name abl_seg_only_2A100 --batch-size 6 --disable-depth --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
+```
 
-# Exp 3: LoRA rank 256, 1×A100
+### Exp 3: LoRA rank 256, 1×A100
+
+```bash
 tmux new-session -d -s exp3 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=6 ~/miniconda/envs/flux_train/bin/python train_script.py --name lora_rank_256_1A100 --batch-size 3 --lora-rank 256 --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
+```
 
-# Exp 4: Uniform timestep weight, 1×A100
+### Exp 4: Uniform timestep weight, 1×A100
+
+```bash
 tmux new-session -d -s exp4 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=7 ~/miniconda/envs/flux_train/bin/python train_script.py --name abl_time_1A100 --batch-size 3 --no-minsnr --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
 ```
 
