@@ -99,8 +99,8 @@ tmux new-session -d -s exp4 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=7 ~/mini
 
 | VRAM (GiB) | Recommended batch_size | Notes |
 |---|---:|---|
-| 80 (A100) | 3 | common production setting |
-| 96 (H100) | 4 | may need gradient checkpointing |
+| 80 (A100) | 3 | 72488 MiB |
+| 96 (H100) | 4 | 88 GiB used |
 | 140 (H200) | 8 | ~126 / 144 GiB used |
 
 > If OOM, reduce `--batch-size` first; keep effective batch size via higher `--grad-accum-steps`.
