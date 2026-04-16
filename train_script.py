@@ -162,7 +162,7 @@ CONFIG = {
     'boundary_threshold': 0.1,
 
     # ── Training ──
-    'num_epochs': 100,
+    'num_epochs': 500,
     'batch_size': 4,            # lora=4, controlnet=1
     'learning_rate': 3e-4,      # Adapter-only run: larger LR safe with only 52M params
     'adapter_lr': 3e-4,         # HDC²A adapter learning rate
