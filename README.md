@@ -111,7 +111,7 @@ tmux new-session -d -s exp4 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=7 ~/mini
 
 | Component | Status | Params |
 |-----------|--------|--------|
-| Flux.2 Transformer backbone | Frozen (FP8) | ~12B |
+| Flux.2 Transformer backbone | Frozen (FP8) | ~32B |
 | ControlNet control blocks + LoRA | **Trainable** | ~4.1B + 9.8M |
 | HDC²A Adapter | **Trainable** | 52.4M |
 
