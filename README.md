@@ -66,8 +66,8 @@ All 4 experiments run concurrently via tmux on different GPUs:
 
 | # | Name | GPUs | BS | Effective BS | Special |
 |---|------|------|----|--------------|---------|
-| 1 | `lora_baseline_4A100_main` | 0,1,2,3 | 3 | 48 | adapter_lr=8e-4 |
-| 2 | `abl_seg_only_2A100` | 4,5 | 3 | 24 | `--disable-depth` |
+| 1 | `lora_baseline_4A100_main` | 0,1,2,3 | 12 | 48 | adapter_lr=8e-4 |
+| 2 | `abl_seg_only_2A100` | 4,5 | 6 | 24 | `--disable-depth` |
 | 3 | `lora_rank_256_1A100` | 6 | 3 | 12 | `--lora-rank 256` |
 | 4 | `abl_time_1A100` | 7 | 3 | 12 | `--no-minsnr` |
 
