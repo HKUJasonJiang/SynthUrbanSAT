@@ -164,8 +164,8 @@ CONFIG = {
     # ── Training ──
     'num_epochs': 500,
     'batch_size': 4,            # lora=4, controlnet=1
-    'learning_rate': 3e-4,      # Adapter-only run: larger LR safe with only 52M params
-    'adapter_lr': 3e-4,         # HDC²A adapter learning rate
+    'learning_rate': 6e-4,      # Adapter-only run: larger LR safe with only 52M params
+    'adapter_lr': 1e-3,         # HDC²A adapter learning rate
     'backbone_lr': 0.0,         # ControlNet backbone LR (0 = completely frozen)
     'weight_decay': 0.01,
     'max_grad_norm': 1.0,

@@ -33,5 +33,6 @@ dependencies:
     # ── Training ──
     - wandb
     - psutil
+    - python-dotenv
     # ── Text Encoder ──
     - sentencepiece

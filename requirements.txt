@@ -11,6 +11,7 @@ wandb
 accelerate
 einops
 sentencepiece
+python-dotenv
 
 # Imported inside functions (lazy-loaded to save startup time)
 diffusers>=0.30.0
