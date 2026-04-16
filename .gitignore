@@ -34,3 +34,6 @@ nohup.out
 *.log
 *.log
 _upload_remaining.py
+
+# Other (analysis notebooks, scratch files)
+other/

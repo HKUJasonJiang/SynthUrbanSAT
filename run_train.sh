@@ -97,6 +97,7 @@ TEXT_DIM=15360
 LOG_INTERVAL=10
 SAVE_EVERY_N_EPOCHS=5
 VAL_EVERY_N_EPOCHS=1
+MILESTONE_PCT=10                     # milestone visualization interval (%, e.g. 10 = every 10%)
 
 # ── WandB ────────────────────────────────────────────────────────────────────
 WANDB_ENTITY=""                 # empty = personal namespace of the logged-in user (safest default)
@@ -159,6 +160,7 @@ CMD=(
     --log-interval "$LOG_INTERVAL"
     --save-every-n-epochs "$SAVE_EVERY_N_EPOCHS"
     --val-every-n-epochs "$VAL_EVERY_N_EPOCHS"
+    --milestone-pct "$MILESTONE_PCT"
 )
 
 # Only pass --wandb-entity if non-empty (empty = use logged-in user's personal namespace)

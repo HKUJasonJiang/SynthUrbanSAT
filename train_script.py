@@ -199,6 +199,7 @@ CONFIG = {
     'log_interval': 10,             # log every N steps within each epoch
     'save_every_n_epochs': 5,
     'val_every_n_epochs': 1,
+    'milestone_pct': 10,             # milestone visualization interval (%)
 
     # ── WandB ──
     'wandb_entity': '',              # empty = personal namespace of logged-in user
@@ -354,6 +355,11 @@ def parse_args():
     p.add_argument('--vis-every', type=int, default=50,
                    help='每隔 N 个 epoch 保存可视化图像（仅 --overfit 模式，默认 50）。')
     # === END OVERFIT TEST ===
+
+    # ── Milestone visualization ──
+    p.add_argument('--milestone-pct', type=int, default=None,
+                   help='Milestone visualization interval as integer percentage '
+                        '(e.g. 10 = every 10%%, 5 = every 5%%). Default: 10.')
 
     return p.parse_args()
 
@@ -554,6 +560,7 @@ def main():
         'wandb_project': 'wandb_project',
         'adapter_lr': 'adapter_lr',
         'backbone_lr': 'backbone_lr',
+        'milestone_pct': 'milestone_pct',
     }
     args_dict = vars(args)
     for arg_name, config_key in _ARG_MAP.items():
@@ -1000,9 +1007,10 @@ def main():
     _step_vis_dir = os.path.join(config['output_dir'], 'step_vis')
     _n_classes = config.get('num_classes', 6)
 
-    # Compute milestone global steps (every 10%: 0%,10%,...,100%)
+    # Compute milestone global steps (configurable via --milestone-pct, default 10%)
     # total_steps = total_epochs × steps_per_epoch
-    _milestone_pcts = [i / 10 for i in range(11)]  # 0.0, 0.1, ..., 1.0
+    _ms_interval = config.get('milestone_pct', 10) / 100  # e.g. 10 → 0.1
+    _milestone_pcts = [i * _ms_interval for i in range(int(1 / _ms_interval) + 1)]
     _milestone_steps = sorted(set(
         int(round(p * max(total_steps - 1, 1))) for p in _milestone_pcts
     ))

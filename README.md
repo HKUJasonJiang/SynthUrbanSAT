@@ -6,18 +6,33 @@ Fine-tune a Flux.2 ControlNet with a custom **Heterogeneous Dual-Condition Adapt
   <img src="docs/architecture.png" width="90%"/>
 </p>
 
-## Quick Start
+## Quick Start (4 Commands)
 
 ```bash
-# 1. Clone & setup (one-click: installs env, downloads data & weights, runs smoke test)
+# 1. Clone & create .env
 git clone https://github.com/HKUJasonJiang/SynthUrbanSAT.git
 cd SynthUrbanSAT
-bash setup.sh
+cp .env.example .env          # fill in HF_TOKEN_READ, HF_TOKEN_WRITE, WANDB_API_KEY
 
-# 2. Train (single GPU)
+# 2. One-click setup (installs env + downloads data & weights + smoke test)
+bash setup.sh --test-both 0,1,2,3
+
+# 3. Train (edit run_train.sh to set NAME, GPUS, hyperparams)
 bash run_train.sh
 
-# 3. Train (multi-GPU DDP)
+# 4. Upload results (auto-upload is enabled by default; manual fallback below)
+bash upload.sh --name <NAME>
+```
+
+> **tmux recommended** — wrap long-running commands in `tmux new-session -s <name> '...'` so they survive SSH disconnects. See [docs/setup_server.md](docs/setup_server.md) for tmux tips.
+
+### Single-GPU vs Multi-GPU
+
+```bash
+# Single GPU (default)
+bash run_train.sh
+
+# Multi-GPU DDP — just set GPUS
 GPUS=0,1,2,3 bash run_train.sh
 ```
 
@@ -32,6 +47,7 @@ bash run_train.sh --test-data --no-wandb   # 1 epoch with real data
 
 ```bash
 bash run_train.sh --lr 5e-6 --batch-size 3 --num-epochs 200 --lora-rank 256
+bash run_train.sh --milestone-pct 5        # save milestone vis every 5% (default: 10%)
 ```
 
 ### Resume from Checkpoint
@@ -39,6 +55,58 @@ bash run_train.sh --lr 5e-6 --batch-size 3 --num-epochs 200 --lora-rank 256
 ```bash
 bash run_train.sh --resume output/checkpoint_epoch_0010
 ```
+
+---
+
+## Experiments (8×A100 80GB)
+
+All 4 experiments run concurrently via tmux on different GPUs:
+
+| # | Name | GPUs | BS | Effective BS | Special |
+|---|------|------|----|--------------|---------|
+| 1 | `lora_baseline_4A100_main` | 0,1,2,3 | 3 | 48 | adapter_lr=8e-4 |
+| 2 | `abl_seg_only_2A100` | 4,5 | 3 | 24 | `--disable-depth` |
+| 3 | `lora_rank_256_1A100` | 6 | 3 | 12 | `--lora-rank 256` |
+| 4 | `abl_time_1A100` | 7 | 3 | 12 | `--no-minsnr` |
+
+<details>
+<summary>Launch commands (copy-paste)</summary>
+
+```bash
+# Exp 1: Main baseline, 4×A100
+tmux new-session -d -s exp1 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  ~/miniconda/envs/flux_train/bin/torchrun --nproc_per_node=4 --master_port=29500 \
+  train_script.py --name lora_baseline_4A100_main --batch-size 3 --adapter-lr 8e-4 \
+  --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
+
+# Exp 2: Seg-only ablation, 2×A100
+tmux new-session -d -s exp2 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=4,5 \
+  ~/miniconda/envs/flux_train/bin/torchrun --nproc_per_node=2 --master_port=29501 \
+  train_script.py --name abl_seg_only_2A100 --batch-size 3 --disable-depth \
+  --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
+
+# Exp 3: LoRA rank 256, 1×A100
+tmux new-session -d -s exp3 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=6 \
+  python train_script.py --name lora_rank_256_1A100 --batch-size 3 --lora-rank 256 \
+  --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
+
+# Exp 4: Uniform timestep weight, 1×A100
+tmux new-session -d -s exp4 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=7 \
+  python train_script.py --name abl_time_1A100 --batch-size 3 --no-minsnr \
+  --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
+```
+
+</details>
+
+### GPU VRAM Reference
+
+| VRAM (GiB) | Recommended batch_size | Notes |
+|---|---:|---|
+| 80 (A100) | 3 | common production setting |
+| 96 (H100) | 4 | may need gradient checkpointing |
+| 140 (H200) | 8 | ~126 / 144 GiB used |
+
+> If OOM, reduce `--batch-size` first; keep effective batch size via higher `--grad-accum-steps`.
 
 ---
 
@@ -66,7 +134,7 @@ bash run_train.sh --resume output/checkpoint_epoch_0010
 ├── upload.sh           ← Push results to HuggingFace
 ├── scripts/            ← Training modules (models, data, utils)
 ├── docs/
-│   ├── setup_server.md     ← Server deployment & multi-GPU guide
+│   ├── setup_server.md     ← Server deployment, tmux workflow, multi-GPU details
 │   └── ARCHITECTURE.md     ← Detailed architecture & tensor shapes
 └── output/             ← Checkpoints & logs
 ```
