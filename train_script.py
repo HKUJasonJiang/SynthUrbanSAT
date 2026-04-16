@@ -23,6 +23,7 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 
 # Force line-buffered stdout so output appears in real time when piped/redirected
 sys.stdout.reconfigure(line_buffering=True)
@@ -36,6 +37,9 @@ os.environ.setdefault('NO_COLOR', '1')
 # === OVERFIT TEST === 减少 CUDA 显存碎片化，有助于 backward 阶段分配激活梯度缓冲区
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 # === END OVERFIT TEST ===
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).with_name('.env'))  # load .env next to this script
 
 import psutil
 import torch
@@ -202,7 +206,7 @@ CONFIG = {
     'milestone_pct': 10,             # milestone visualization interval (%)
 
     # ── WandB ──
-    'wandb_entity': '',              # empty = personal namespace of logged-in user
+    'wandb_entity': 'hku-xg-boost',              # team entity for jasonjiang@connect.hku.hk
     'wandb_project': '<plz rewrite project name> via --name',        # can modify per run via --name
 
     # ── Resume ──
@@ -360,6 +364,9 @@ def parse_args():
     p.add_argument('--milestone-pct', type=int, default=None,
                    help='Milestone visualization interval as integer percentage '
                         '(e.g. 10 = every 10%%, 5 = every 5%%). Default: 10.')
+    p.add_argument('--skip-stepvis', action='store_true', default=False,
+                   help='Skip intermediate milestone visualizations; only run '
+                        'the final grid at the last step.')
 
     return p.parse_args()
 
@@ -1016,7 +1023,10 @@ def main():
     ))
     # Labels shown in the big grid header (e.g. "step 0", "step 200")
     _milestone_labels = [f'step {s}' for s in _milestone_steps]
-    print(f'  {bold_cyan("[Milestone Vis]")} steps: {_milestone_steps}')
+    if args.skip_stepvis:
+        print(f'  {bold_cyan("[Milestone Vis]")} --skip-stepvis: only final step {_milestone_steps[-1]}')
+    else:
+        print(f'  {bold_cyan("[Milestone Vis]")} steps: {_milestone_steps}')
 
     # Fixed vis batches — first N samples from each split
     # train/val: 10 samples, test: all samples
@@ -1126,25 +1136,32 @@ def main():
         _hf_repo = args.hf_repo
         if _hf_repo:
             try:
-                from ControlNet_training.HDC2A_training.scripts.version_file.upload import upload_to_hf
+                from huggingface_hub import HfApi
+                _hf_api = HfApi(token=os.environ.get('HF_TOKEN_WRITE'))
                 _hf_path = f'output/{args.name}'
-                # Exclude checkpoint dirs and .pt files (large); upload vis + logs only
                 _ignore = ['checkpoint_*/**', '*.pt', 'wandb/**']
                 print(f'  {bold_cyan("[HF Upload]")} syncing to {_hf_repo}/{_hf_path} ...')
-                _hf_url = upload_to_hf(
-                    local_dir=config['output_dir'],
-                    repo=_hf_repo,
+                _hf_api.upload_folder(
+                    folder_path=config['output_dir'],
+                    repo_id=_hf_repo,
                     path_in_repo=_hf_path,
                     ignore_patterns=_ignore,
+                    repo_type='model',
                 )
+                _hf_url = f'https://huggingface.co/{_hf_repo}/tree/main/{_hf_path}'
                 print(f'  {bold_green("[HF Upload]")} ✓ {_hf_url}')
             except Exception as _hf_err:
                 print(f'  {bold_yellow("[HF Upload WARN]")} upload failed: {_hf_err}')
 
     # Callback for the train loop: fires only at milestone steps
     def _milestone_step_callback(_global_step, _batch):
-        if _global_step in _milestone_set:
-            _run_milestone_vis(_global_step)
+        if args.skip_stepvis:
+            # Only run vis at the very last step
+            if _global_step == _milestone_steps[-1]:
+                _run_milestone_vis(_global_step)
+        else:
+            if _global_step in _milestone_set:
+                _run_milestone_vis(_global_step)
 
     _active_step_vis_callback = _milestone_step_callback
 
@@ -1272,16 +1289,19 @@ def main():
     # ── Final HF upload (after loss curve is saved) ───────────────────────
     if is_main and args.hf_repo:
         try:
-            from ControlNet_training.HDC2A_training.scripts.version_file.upload import upload_to_hf
+            from huggingface_hub import HfApi
+            _hf_api = HfApi(token=os.environ.get('HF_TOKEN_WRITE'))
             _hf_path = f'output/{args.name}'
             _ignore = ['checkpoint_*/**', '*.pt', 'wandb/**']
             print(f'  {bold_cyan("[HF Upload]")} final sync to {args.hf_repo}/{_hf_path} ...')
-            _hf_url = upload_to_hf(
-                local_dir=config['output_dir'],
-                repo=args.hf_repo,
+            _hf_api.upload_folder(
+                folder_path=config['output_dir'],
+                repo_id=args.hf_repo,
                 path_in_repo=_hf_path,
                 ignore_patterns=_ignore,
+                repo_type='model',
             )
+            _hf_url = f'https://huggingface.co/{args.hf_repo}/tree/main/{_hf_path}'
             print(f'  {bold_green("[HF Upload]")} ✓ {_hf_url}')
         except Exception as _hf_err:
             print(f'  {bold_yellow("[HF Upload WARN]")} final upload failed: {_hf_err}')
