@@ -74,7 +74,7 @@ All 4 experiments run concurrently via tmux on different GPUs:
 ### Exp 1: Main baseline, MLP, 4×A100
 
 ```bash
-tmux new-session -d -s exp1 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=0,1,2,3 ~/miniconda/envs/flux_train/bin/torchrun --nproc_per_node=4 --master_port=29500 train_script.py --name lora_baseline_mlp_4A100_main --adapter_lr 8e-3 --lora_lr 2e-4 --adapter-mlp --batch-size 12 --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
+tmux new-session -d -s exp1 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=0,1,2,3 ~/miniconda/envs/flux_train/bin/torchrun --nproc_per_node=4 --master_port=29500 train_script.py --name lora_baseline_mlp_4A100_main --adapter_lr 8e-3 --lora_lr 2e-4 --adapter-mlp --augment --batch-size 12 --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
 ```
 
 ### Exp 2: Seg-only ablation, MLP, 2×A100
