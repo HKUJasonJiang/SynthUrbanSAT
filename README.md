@@ -18,7 +18,8 @@ cp .env.example .env          # fill in HF_TOKEN_READ, HF_TOKEN_WRITE, WANDB_API
 bash setup.sh --test-both 0,1,2,3
 
 # 3. Launch all 4 experiments (auto WandB + auto HF upload)
-bash run.sh
+# refer to the command below
+# bash run.sh
 
 # 4. Monitor
 tmux ls                        # list running experiments
@@ -71,25 +72,25 @@ All 4 experiments run concurrently via tmux on different GPUs:
 | 3 | `lora_rank_256_1A100` | 6 | 3 | 12 | `--lora-rank 256` |
 | 4 | `abl_time_1A100` | 7 | 3 | 12 | `--no-minsnr` |
 
-### Exp 1: Main baseline, MLP, 4×A100
+### Exp 1: Main baseline, MLP, 4×A100 (lora_rank=64, augment, full 1k dataset)
 
 ```bash
 tmux new-session -d -s exp1 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=0,1,2,3 ~/miniconda/envs/flux_train/bin/torchrun --nproc_per_node=4 --master_port=29500 train_script.py --name lora_baseline_mlp_4A100_main --adapter_lr 8e-3 --lora_lr 2e-4 --adapter-mlp --augment --batch-size 12 --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
 ```
 
-### Exp 2: Seg-only ablation, MLP, 2×A100
+### Exp 2: Seg-only ablation, MLP, 2×A100 (lora_rank=64, full 1k dataset)
 
 ```bash
 tmux new-session -d -s exp2 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=4,5 ~/miniconda/envs/flux_train/bin/torchrun --nproc_per_node=2 --master_port=29501 train_script.py --name abl_seg_only_mlp_2A100 --batch-size 6 --disable-depth --adapter_lr 3e-3 --lora_lr 2e-4 --adapter-mlp --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
 ```
 
-### Exp 3: LoRA rank 256, MLP, 1×A100
+### Exp 3: LoRA rank 256, MLP, 1×A100 (lora_rank=256, full 1k dataset)
 
 ```bash
 tmux new-session -d -s exp3 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=6 ~/miniconda/envs/flux_train/bin/python train_script.py --name lora_rank_256_mlp_1A100 --batch-size 3 --adapter_lr 1e-3 --lora_lr 1e-4 --adapter-mlp --lora-rank 256 --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
 ```
 
-### Exp 4: Uniform timestep weight, MLP, 1×A100
+### Exp 4: Uniform timestep weight, MLP, 1×A100 (full 1k dataset)
 
 ```bash
 tmux new-session -d -s exp4 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=7 ~/miniconda/envs/flux_train/bin/python train_script.py --name abl_time_mlp_1A100 --batch-size 3 --adapter_lr 1e-3 --lora_lr 1e-4 --adapter-mlp --no-minsnr --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
