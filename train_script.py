@@ -343,9 +343,9 @@ def parse_args():
                         'in HDC²A. Fewer params, faster; good for small datasets.')
 
     p.add_argument('--no-lora', action='store_true',
-                   help='Disable LoRA injection (by default LoRA is ON with rank=32).')
-    p.add_argument('--lora-rank', type=int, default=32,
-                   help='LoRA rank (default: 32).')
+                   help='Disable LoRA injection (by default LoRA is ON with rank=64).')
+    p.add_argument('--lora-rank', type=int, default=64,
+                   help='LoRA rank (default: 64).')
     p.add_argument('--lora-alpha', type=float, default=None,
                    help='LoRA alpha (default: same as --lora-rank).')
 
