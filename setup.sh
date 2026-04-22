@@ -47,8 +47,8 @@ if [[ -f "$SCRIPT_DIR/.env" ]]; then
 fi
 
 # HuggingFace repos
-# HF_DATASET_REPO="JasonXF/US3D-Enhanced"
-HF_DATASET_REPO="JasonXF/DFC2019-10k"
+HF_DATASET_REPO="JasonXF/US3D-Enhanced"
+# HF_DATASET_REPO="JasonXF/DFC2019-10k"
 HF_MODEL_REPO="JasonXF/SynthUrbanSAT"
 HF_TOKEN_READ="${HF_TOKEN_READ:-}"
 HF_TOKEN_WRITE="${HF_TOKEN_WRITE:-}"
