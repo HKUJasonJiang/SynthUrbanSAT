@@ -214,12 +214,19 @@ class HDC2AAdapter(nn.Module):
     Output:
         control_tokens: [B, N_ctrl, output_dim]
         where N_ctrl = (H/16)*(W/16) = 1024 for 512×512 input
+
+    Args:
+        use_mlp_fusion: If True, replace 3× DoubleStreamFusionBlock with a
+            lightweight MLP.  Much fewer parameters; suitable when data is
+            limited.
     """
     def __init__(self, num_classes=5, fusion_dim=768, output_dim=3072,
                  num_heads=12, num_fusion_blocks=3, num_fourier_bands=32,
-                 boundary_threshold=0.1, image_size=512):
+                 boundary_threshold=0.1, image_size=512,
+                 use_mlp_fusion=False):
         super().__init__()
         self.output_dim = output_dim
+        self.use_mlp_fusion = use_mlp_fusion
 
         # Encoders use stride=8, so spatial tokens = (image_size/8)^2
         max_seq_len = (image_size // 8) ** 2
@@ -230,10 +237,19 @@ class HDC2AAdapter(nn.Module):
         self.depth_encoder = DepthEncoder(
             num_fourier_bands=num_fourier_bands, out_dim=fusion_dim)
 
-        self.fusion_blocks = nn.ModuleList([
-            DoubleStreamFusionBlock(dim=fusion_dim, num_heads=num_heads,
-                                   max_seq_len=max_seq_len)
-            for _ in range(num_fusion_blocks)])
+        if use_mlp_fusion:
+            # Lightweight MLP fusion: cat(T_s, T_d) [2*fusion_dim] → fusion_dim per stream
+            self.mlp_fusion = nn.Sequential(
+                nn.LayerNorm(fusion_dim * 2),
+                nn.Linear(fusion_dim * 2, fusion_dim * 2),
+                nn.GELU(),
+                nn.Linear(fusion_dim * 2, fusion_dim * 2),
+            )
+        else:
+            self.fusion_blocks = nn.ModuleList([
+                DoubleStreamFusionBlock(dim=fusion_dim, num_heads=num_heads,
+                                       max_seq_len=max_seq_len)
+                for _ in range(num_fusion_blocks)])
 
         self.gate_net = nn.Sequential(
             nn.Linear(fusion_dim * 2, fusion_dim), nn.GELU(),
@@ -248,8 +264,13 @@ class HDC2AAdapter(nn.Module):
         T_s = self.semantic_encoder(seg_map)
         T_d = self.depth_encoder(depth_map)
 
-        for block in self.fusion_blocks:
-            T_s, T_d = block(T_s, T_d)
+        if self.use_mlp_fusion:
+            T_cat = torch.cat([T_s, T_d], dim=-1)       # [B, N, 2*D]
+            T_cat = T_cat + self.mlp_fusion(T_cat)       # residual
+            T_s, T_d = T_cat.chunk(2, dim=-1)            # [B, N, D] each
+        else:
+            for block in self.fusion_blocks:
+                T_s, T_d = block(T_s, T_d)
 
         T_concat = torch.cat([T_s, T_d], dim=-1)
         g = self.gate_net(T_concat)

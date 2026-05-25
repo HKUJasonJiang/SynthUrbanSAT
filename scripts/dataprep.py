@@ -187,7 +187,7 @@ def create_dataloaders(dataset_dir, color_map_path, image_size=512,
                        batch_size=1, num_workers=0, num_classes=5,
                        embeddings_dict=None, shuffle_train=True,
                        use_augment=False, augment_kwargs=None,
-                       include_test=False):
+                       include_test=False, distributed=False):
     """Create train, validation, and optionally test dataloaders.
 
     Args:
@@ -202,6 +202,7 @@ def create_dataloaders(dataset_dir, color_map_path, image_size=512,
         use_augment: enable data augmentation on the training split
         augment_kwargs: dict of keyword arguments forwarded to HDC2AAugment
         include_test: if True, also create and return a test_loader
+        distributed: if True, use DistributedSampler for train/val splits
 
     Returns:
         (train_loader, val_loader)            when include_test=False
@@ -217,7 +218,7 @@ def create_dataloaders(dataset_dir, color_map_path, image_size=512,
     val_loader = None
     test_loader = None
 
-    def _make_loader(split_name, shuffle=False, augment=None):
+    def _make_loader(split_name, shuffle=False, augment=None, use_distributed=False):
         split_dir = os.path.join(dataset_dir, split_name)
         if not (os.path.isdir(split_dir) and os.path.isdir(os.path.join(split_dir, 'rgb'))):
             print(f'[Data] No {split_name}/ directory at {split_dir} — skipping.')
@@ -228,20 +229,35 @@ def create_dataloaders(dataset_dir, color_map_path, image_size=512,
         if len(ds) == 0:
             print(f'[Data] {split_name.capitalize()} directory exists but no images found.')
             return None
-        loader = DataLoader(
-            ds, batch_size=batch_size, shuffle=shuffle,
-            num_workers=num_workers, pin_memory=True,
-            drop_last=(split_name == 'train'),
-        )
-        print(f'[Data] {split_name.capitalize()}: {len(ds)} samples, batch_size={batch_size}')
+
+        sampler = None
+        if use_distributed:
+            from torch.utils.data.distributed import DistributedSampler
+            sampler = DistributedSampler(ds, shuffle=shuffle)
+            loader = DataLoader(
+                ds, batch_size=batch_size, sampler=sampler,
+                num_workers=num_workers, pin_memory=True,
+                drop_last=(split_name == 'train'),
+            )
+        else:
+            loader = DataLoader(
+                ds, batch_size=batch_size, shuffle=shuffle,
+                num_workers=num_workers, pin_memory=True,
+                drop_last=(split_name == 'train'),
+            )
+
+        print(f'[Data] {split_name.capitalize()}: {len(ds)} samples, batch_size={batch_size}'
+              f'{" (distributed)" if use_distributed else ""}')
         if split_name == 'train' and embeddings_dict:
             has_global = 'global' in embeddings_dict
             print(f'[Data] Train: using {"global" if has_global else "per-sample"} text embeddings')
         return loader
 
-    train_loader = _make_loader('train', shuffle=shuffle_train, augment=train_augment)
-    val_loader   = _make_loader('val',   shuffle=False)
+    train_loader = _make_loader('train', shuffle=shuffle_train, augment=train_augment,
+                                use_distributed=distributed)
+    val_loader   = _make_loader('val',   shuffle=False, use_distributed=distributed)
     if include_test:
-        test_loader = _make_loader('test', shuffle=False)
+        # Test loader: no distributed sampler (only used for vis on rank 0)
+        test_loader = _make_loader('test', shuffle=False, use_distributed=False)
         return train_loader, val_loader, test_loader
     return train_loader, val_loader
