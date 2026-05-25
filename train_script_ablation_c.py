@@ -20,6 +20,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -43,6 +44,7 @@ load_dotenv(Path(__file__).with_name('.env'))  # load .env next to this script
 
 import psutil
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
@@ -52,7 +54,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 os.chdir(PROJECT_ROOT)
 sys.path.insert(0, PROJECT_ROOT)
 
-from scripts.models import HDC2AAdapter
+from scripts.models import DepthEncoder
 from scripts.dataprep import create_dataloaders
 from scripts.utility import (
     check_memory, clear_cache, load_vae, load_transformer,
@@ -105,6 +107,34 @@ class _TeeLogger:
         return self._stream.fileno()
     def isatty(self):
         return self._stream.isatty() if hasattr(self._stream, 'isatty') else False
+
+
+class AblationCDepthOnlyAdapter(nn.Module):
+    """(c) Depth-only condition baseline."""
+
+    def __init__(self, fusion_dim=768, output_dim=3072,
+                 num_fourier_bands=32):
+        super().__init__()
+        self.depth_encoder = DepthEncoder(
+            num_fourier_bands=num_fourier_bands,
+            out_dim=fusion_dim,
+        )
+        self.proj = nn.Linear(fusion_dim, output_dim)
+        self.output_scale = nn.Parameter(torch.tensor(-5.0))
+        self.spatial_downsample = nn.AvgPool2d(kernel_size=2, stride=2)
+
+    def forward(self, seg_map, depth_map):
+        # Key ablation point: ignore segmentation condition completely.
+        del seg_map
+        T_d = self.depth_encoder(depth_map)
+        T_ctrl = self.proj(T_d) * self.output_scale.sigmoid()
+
+        B, N, D = T_ctrl.shape
+        H = W = int(math.sqrt(N))
+        T_ctrl = T_ctrl.transpose(1, 2).reshape(B, D, H, W)
+        T_ctrl = self.spatial_downsample(T_ctrl)
+        T_ctrl = T_ctrl.flatten(2).transpose(1, 2)
+        return T_ctrl
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -332,15 +362,14 @@ def parse_args():
 
     # ── Ablation controls ──
     p.add_argument('--disable-depth', action='store_true',
-                   help='Zero out depth input to HDC²A (seg-only ablation).')
+                   help='Accepted for CLI compatibility; ignored by ablation C.')
     p.add_argument('--no-minsnr', action='store_true',
                    help='Disable min-SNR loss weighting; use uniform weight w=1.')
 
     # ── LoRA (enabled by default, disable with --no-lora) ──
     # ── Adapter fusion mode ──
     p.add_argument('--adapter-mlp', action='store_true',
-                   help='Use lightweight MLP fusion instead of DoubleStream attention '
-                        'in HDC²A. Fewer params, faster; good for small datasets.')
+                   help='Accepted for CLI compatibility; ignored by ablation C.')
 
     p.add_argument('--no-lora', action='store_true',
                    help='Disable LoRA injection (by default LoRA is ON with rank=64).')
@@ -595,7 +624,9 @@ def main():
 
     # ── Ablation flags → config ─────────────────────────────────────────────
     if args.disable_depth:
-        config['disable_depth'] = True
+        if is_main:
+            print(f'{bold_yellow("WARNING:")} --disable-depth is ignored for ablation C '
+                  '(depth-only); depth input remains enabled.')
     if args.no_minsnr:
         config['minsnr_loss_weight'] = False
 
@@ -674,13 +705,6 @@ def main():
                 _wandb_kwargs['entity'] = _wandb_entity
             run = wandb.init(**_wandb_kwargs)
             config['_wandb_active'] = True
-            # Define training_flops as a custom x-axis so WandB can plot
-            # val_loss / train_loss vs cumulative compute (like scaling-law curves).
-            wandb.define_metric("training_flops")
-            wandb.define_metric("train_loss",   step_metric="training_flops")
-            wandb.define_metric("val_loss",     step_metric="training_flops")
-            wandb.define_metric("val/*",        step_metric="training_flops")
-            wandb.define_metric("step_loss",    step_metric="training_flops")
         except Exception as _wandb_err:
             print(f'\n{bold_yellow("WARNING: WandB init failed — training will continue without logging.")}')
             print(f'  Error: {_wandb_err}')
@@ -692,14 +716,14 @@ def main():
     # ── Print final resolved config ────────────────────────────────────────
     if is_main:
         # Run summary: key flags at a glance
-        _fusion_mode = 'MLP (lightweight)' if getattr(args, 'adapter_mlp', False) else 'DoubleStream Attention'
+        _ablation_adapter = 'C: depth-only adapter'
         _lora_status = 'OFF' if getattr(args, 'no_lora', False) else f'ON (rank={getattr(args, "lora_rank", 32)})'
-        _depth_status = 'DISABLED (seg-only ablation)' if getattr(args, 'disable_depth', False) else 'enabled'
+        _depth_status = 'enabled'
         _minsnr_status = 'OFF (uniform weight)' if getattr(args, 'no_minsnr', False) else 'ON'
         _augment_status = 'ON' if args_dict.get('use_augment') else 'OFF'
         print(f'\n{bold_cyan("Run Summary:")}')
         print(f'  {"name":<20s} {bold(args.name)}')
-        print(f'  {"fusion":<20s} {_fusion_mode}')
+        print(f'  {"ablation":<20s} {_ablation_adapter}')
         print(f'  {"LoRA":<20s} {_lora_status}')
         print(f'  {"depth input":<20s} {_depth_status}')
         print(f'  {"min-SNR weighting":<20s} {_minsnr_status}')
@@ -824,22 +848,16 @@ def main():
         print('  Gradients will still propagate to HDC²A via control_context autograd')
     check_memory('after Transformer')
 
-    # ── Create HDC²A Adapter ────────────────────────────────────────────────
-    phase('[4/8] Creating HDC²A Adapter', config)
-    _use_mlp_fusion = getattr(args, 'adapter_mlp', False)
-    hdc2a = HDC2AAdapter(
-        num_classes=config['num_classes'],
+    # ── Create Ablation Adapter (c: depth-only) ─────────────────────────────
+    # Key ablation: depth-only adapter takes NO num_classes / boundary_threshold
+    # since segmentation is dropped entirely.
+    phase('[4/8] Creating Ablation Adapter (c: depth-only)', config)
+    hdc2a = AblationCDepthOnlyAdapter(
         fusion_dim=config['fusion_dim'],
         output_dim=config['control_in_dim'],
-        num_heads=config['num_heads'],
-        num_fusion_blocks=config['num_fusion_blocks'],
         num_fourier_bands=config['num_fourier_bands'],
-        boundary_threshold=config['boundary_threshold'],
-        image_size=config['image_size'],
-        use_mlp_fusion=_use_mlp_fusion,
     ).to(device, dtype)
-    if _use_mlp_fusion:
-        print(f'  Fusion mode: MLP (lightweight)')
+    print('  Ablation mode: (c) Depth-only condition')
 
     hdc2a_params = sum(p.numel() for p in hdc2a.parameters())
     ctrl_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
@@ -935,23 +953,22 @@ def main():
     check_memory('after test')
 
     # ── FLOPs profile (forward only; one-time analysis) ────────────────────
-    _fwd_flops_per_sample = 0  # set below; used to compute cumulative training FLOPs
     if is_main:
         try:
             _flops_stats = profile_forward_flops(hdc2a_raw, transformer, config)
             _hdc_g = _flops_stats['hdc2a_flops'] / 1e9
             _tr_g = _flops_stats['transformer_flops'] / 1e9
             _tot_g = _flops_stats['total_flops'] / 1e9
-            _fwd_flops_per_sample = _flops_stats['total_flops'] / max(_flops_stats['batch_size'], 1)
             print('\n[FLOPs] Forward-only estimate (torch.profiler, approximate)')
             print(f"  batch_size: {_flops_stats['batch_size']}")
-            print(f"  hdc2a: {_hdc_g:.3f} GFLOPs  transformer: {_tr_g:.3f} GFLOPs  total: {_tot_g:.3f} GFLOPs")
-            print(f"  per-sample forward FLOPs: {_fwd_flops_per_sample/1e9:.3f} GFLOPs")
-            # Log once as run-level constants
+            print(f"  hdc2a: {_hdc_g:.3f} GFLOPs")
+            print(f"  transformer: {_tr_g:.3f} GFLOPs")
+            print(f"  total: {_tot_g:.3f} GFLOPs")
             wandb.log({
-                'flops/hdc2a_per_sample_gflops':       _flops_stats['hdc2a_flops'] / max(_flops_stats['batch_size'], 1) / 1e9,
-                'flops/transformer_per_sample_gflops': _flops_stats['transformer_flops'] / max(_flops_stats['batch_size'], 1) / 1e9,
-                'flops/total_per_sample_gflops':       _fwd_flops_per_sample / 1e9,
+                'flops/batch_size': _flops_stats['batch_size'],
+                'flops/hdc2a': _flops_stats['hdc2a_flops'],
+                'flops/transformer': _flops_stats['transformer_flops'],
+                'flops/total': _flops_stats['total_flops'],
             })
         except Exception as _flops_err:
             print(f"[FLOPs WARN] profiling skipped: {_flops_err}")
@@ -1056,13 +1073,6 @@ def main():
     train_start_time = time.time()
     _train_losses = []   # for loss-curve PNG
     _cumulative_opt_steps = _resume_global_step  # tracks optimizer steps across epochs
-
-    # ── Cumulative Training FLOPs counter ───────────────────────────────────
-    # _fwd_flops_per_sample × batch_size × steps_per_epoch × 3 (fwd+bwd≈3×fwd)
-    # Used as x-axis for val_loss / train_loss plots in WandB (scaling-law style).
-    _steps_per_epoch = len(train_loader)
-    _flops_per_epoch = int(_fwd_flops_per_sample * config['batch_size'] * _steps_per_epoch * 3)
-    _cumulative_training_flops = 0  # incremented after each epoch
 
     # === OVERFIT TEST ===
     _overfit_mode = config.get('_overfit_mode', False)
@@ -1252,7 +1262,6 @@ def main():
         epochs_done = epoch - start_epoch + 1
         eta = elapsed / epochs_done * (total_epochs - start_epoch - epochs_done)
         _cumulative_opt_steps += _epoch_opt_steps
-        _cumulative_training_flops += _flops_per_epoch
         if is_main:
             print(f'  Train loss: {yellow(f"{train_loss:.6f}")} ({epoch_time:.1f}s)  '
                   f'ETA: {cyan(f"{eta/60:.0f}min")}')
@@ -1261,7 +1270,6 @@ def main():
         wandb.log({
             "epoch": epoch,
             "train_loss": train_loss,
-            "training_flops": _cumulative_training_flops,
             "adapter_lr": optimizer.param_groups[0]['lr'],
             "gpu_mem_gib": torch.cuda.memory_allocated() / (1024 ** 3),
             "cpu_pct": psutil.cpu_percent(),
@@ -1278,7 +1286,7 @@ def main():
             if is_main:
                 _bin_str = '  '.join(f'{k}={v:.4f}' for k, v in _val_t_bins.items())
                 print(f'  Val loss: {val_loss:.6f}  [{_bin_str}]')
-            _wandb_val = {"val_loss": val_loss, "training_flops": _cumulative_training_flops}
+            _wandb_val = {"val_loss": val_loss}
             _wandb_val.update({f'val/{k}': v for k, v in _val_t_bins.items()})
             wandb.log(_wandb_val)
 

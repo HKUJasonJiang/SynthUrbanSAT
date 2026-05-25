@@ -82,6 +82,85 @@ def flow_matching_forward(target_packed, t):
     return noisy_latent, noise, flow_target
 
 
+def profile_forward_flops(hdc2a, transformer, config):
+    """Estimate forward FLOPs for HDC²A and transformer with a dummy batch.
+
+    Notes:
+        - Uses torch.profiler(with_flops=True), so values are approximate.
+        - Reports forward-only FLOPs (no backward/optimizer FLOPs).
+        - Intended for analysis only; it does not alter training states.
+    """
+    from torch.profiler import profile, ProfilerActivity
+
+    device = config['device']
+    dtype = config['dtype']
+    img_size = int(config['image_size'])
+    num_classes = int(config.get('num_classes', 6))
+    seq_len = int(config.get('text_seq_len', 512))
+    text_dim = int(config.get('text_dim', 15360))
+    batch_size = int(config.get('flops_profile_batch_size', 1))
+
+    # Keep profiling batch minimal by default to avoid extra VRAM spikes.
+    B = max(1, batch_size)
+    seg = torch.randint(0, num_classes, (B, img_size, img_size), device=device)
+    depth = torch.rand(B, 1, img_size, img_size, device=device, dtype=dtype)
+
+    h2 = w2 = img_size // 16
+    n, c = h2 * w2, 128
+    x = torch.randn(B, n, c, device=device, dtype=dtype)
+    prompt_embeds = torch.randn(B, seq_len, text_dim, device=device, dtype=dtype)
+    text_ids = prepare_text_ids(prompt_embeds, device)
+    dummy = torch.zeros(B, c, h2, w2, device=device, dtype=dtype)
+    latent_ids = prepare_latent_ids(dummy, device)
+    timestep = torch.full((B,), 0.5, device=device, dtype=dtype)
+    guidance = torch.full((B,), float(config.get('guidance_scale', 3.5)),
+                          device=device, dtype=dtype)
+
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available() and str(device).startswith('cuda'):
+        activities.append(ProfilerActivity.CUDA)
+
+    def _autocast_ctx():
+        if str(device).startswith('cuda'):
+            return torch.amp.autocast('cuda', dtype=dtype)
+        return nullcontext()
+
+    def _sum_flops(prof_obj):
+        total = 0
+        for evt in prof_obj.key_averages():
+            total += int(getattr(evt, 'flops', 0) or 0)
+        return total
+
+    with torch.no_grad():
+        with profile(activities=activities, with_flops=True, record_shapes=False) as prof_hdc:
+            with _autocast_ctx():
+                ctrl_ctx = hdc2a(seg, depth)
+        hdc_flops = _sum_flops(prof_hdc)
+
+    with torch.no_grad():
+        with profile(activities=activities, with_flops=True, record_shapes=False) as prof_tr:
+            with _autocast_ctx():
+                out = transformer(
+                    hidden_states=x,
+                    encoder_hidden_states=prompt_embeds,
+                    timestep=timestep,
+                    img_ids=latent_ids,
+                    txt_ids=text_ids,
+                    guidance=guidance,
+                    control_context=ctrl_ctx.to(transformer.dtype),
+                    return_dict=False,
+                )
+                _ = out[0]
+        tr_flops = _sum_flops(prof_tr)
+
+    return {
+        'batch_size': B,
+        'hdc2a_flops': hdc_flops,
+        'transformer_flops': tr_flops,
+        'total_flops': hdc_flops + tr_flops,
+    }
+
+
 def train_one_epoch(epoch, hdc2a, transformer, vae, bn_mean, bn_std,
                     train_loader, optimizer, scaler, config, scheduler=None,
                     step_vis_callback=None, step_vis_interval=10):
