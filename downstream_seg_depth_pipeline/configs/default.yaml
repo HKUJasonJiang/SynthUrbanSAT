@@ -1,0 +1,53 @@
+# Downstream evaluation config for SynthUrbanSAT (ICLR experiments).
+#
+# Frozen-backbone probing: only the task head is trained. The single
+# variable across experiments is the *training data mixture* (real /
+# synthetic / real+synthetic). Test set is always real US3D.
+
+seed: 0
+num_classes: 6
+ignore_index: 255
+image_size: 518          # DINOv2 ViT/14 -> 37x37 patch grid (518 = 14*37)
+ndsm_max_m: 25.0         # height clamp ceiling (metres) for normalization / vis
+
+backbone:
+  name: dinov2_vitl14    # one of: dinov2_vits14, dinov2_vitb14, dinov2_vitl14, dinov2_vitg14
+  freeze: true           # frozen probing (ICLR main protocol)
+  out_indices: [4, 11, 17, 23]   # 4 intermediate layers for DPT (ViT-L has 24 blocks)
+
+head:
+  type: dpt              # 'linear' (seg only) or 'dpt' (seg + depth)
+  hidden_dim: 256
+
+task: segmentation       # 'segmentation' or 'height'
+
+# Data roots. Each must contain rgb/ seg/ depth/ subdirs (see scripts/data.py).
+data:
+  real_root: ../train_pipeline/dataset      # US3D real (train/val/test split dirs)
+
+  # Two synthetic sources (see docs/EXPERIMENT_PLAN.md section 3):
+  #   us3d_paired (Sp): RGB generated FROM US3D's own seg+nDSM -> same layouts as
+  #                     real, isolates generated-RGB fidelity (TSTR upper bound).
+  #   osm        (So): RGB generated from OSM-derived seg+nDSM -> novel, unlimited
+  #                     layouts, tests scaling + diversity ("larger").
+  synth_sources:
+    us3d_paired: ./dataset_synth_us3d
+    osm: ./dataset_synth_osm
+  synth_source: osm         # which source the current run draws synthetic tiles from
+  synth_root: ./dataset_synth   # back-compat fallback if synth_sources is absent
+
+  # Mixture for a single run. real_fraction=0 -> synthetic-only (S/TSTR);
+  # synth_count=0 -> real-only (R).
+  real_fraction: 1.0
+  synth_count: 0          # number of synthetic tiles to add (0 = none)
+
+train:
+  epochs: 50
+  batch_size: 8
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  num_workers: 4
+  amp: true
+
+eval:
+  height_threshold_m: 1.0   # for DFC mIoU-3 combined metric

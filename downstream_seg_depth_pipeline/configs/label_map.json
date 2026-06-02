@@ -1,0 +1,12 @@
+{
+  "_comment": "Unified 6-class label space shared by US3D-Enhanced and OSM synthetic seg. Indices match train_pipeline/configs/color_map.json. ignore_index=255 is used for void/no-data pixels (e.g. NaN AGL).",
+  "ignore_index": 255,
+  "classes": {
+    "0": { "name": "road",     "rgb": [0, 0, 255] },
+    "1": { "name": "water",    "rgb": [0, 225, 255] },
+    "2": { "name": "foliage",  "rgb": [0, 255, 0] },
+    "3": { "name": "building", "rgb": [255, 0, 0] },
+    "4": { "name": "grass",    "rgb": [128, 0, 128] },
+    "5": { "name": "ground",   "rgb": [0, 0, 0] }
+  }
+}
