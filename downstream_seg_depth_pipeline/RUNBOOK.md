@@ -40,16 +40,14 @@ conda activate flux_train
 # 提供 HF token（必填）
 export HF_TOKEN=hf_xxxxxxxxxxxxxxxxx
 
-# 基础 FLUX.2 权重的来源，二选一：
-#   (a) 服务器上已有 ComfyUI  -> 指向其 models 目录
-export COMFY_MODELS=/path/to/ComfyUI/models
-#   (b) 没有 ComfyUI         -> 指向一个存放 4 个 fp8 safetensors 的 HF 仓库
-# export BASE_WEIGHTS_REPO=your-hf-name/flux2-base-fp8
+# 权重默认从 JasonXF/SynthUrbanSAT_bestmodel 下载，通常不用额外设置。
+# 如需覆盖到别的 repo，再设置：
+# export WEIGHTS_REPO=your-hf-name/your-weights-repo
 ```
 
 > 4 个基础权重文件：`flux2_dev_fp8mixed.safetensors`、`flux2-vae.safetensors`、
 > `mistral_3_small_flux2_fp8.safetensors`、`FLUX.2-dev-Fun-Controlnet-Union-2602.safetensors`。
-> LoRA / HDC²A checkpoint 和 tokenizer 会自动从 `JasonXF/Flux2-dev-controlnet-lora-weights`
+> LoRA / HDC²A checkpoint 和 tokenizer 已一起打包在 `JasonXF/SynthUrbanSAT_bestmodel`，
 > 用 `HF_TOKEN` 下载，无需手动处理。
 
 ## 2. 安装 + 下权重（一条命令）
@@ -58,9 +56,9 @@ export COMFY_MODELS=/path/to/ComfyUI/models
 bash setup.sh
 ```
 
-它会：安装下游探针与生成管线的 Python 依赖 → 调用
-`../generation_pipeline/setup.sh` 拉取 tokenizer + LoRA + 基础权重 → 若基础权重缺失
-且设置了 `BASE_WEIGHTS_REPO` 则从 HF 补齐。结束时打印 `Setup complete.`。
+它会：安装下游探针与生成管线的 Python 依赖 → 从
+`JasonXF/SynthUrbanSAT_bestmodel` 拉取 `generation_pipeline/weights` 所需的
+`base/`、`lora/`、`tokenizer/` → 验证权重齐全。结束时打印 `Setup complete.`。
 
 ## 3. 跑完整 Phase 1（一条命令）
 
@@ -136,7 +134,7 @@ scaling / low-data 曲线、`osm` 合成源、联合 mIoU-3 等都在
 
 | 现象 | 处理 |
 |------|------|
-| `MISSING base weights` | 没设 `COMFY_MODELS` 或 `BASE_WEIGHTS_REPO`，回到第 1 节补齐后重跑 `setup.sh` |
+| `base FLUX.2 weights still missing` | `HF_TOKEN` 对 `JasonXF/SynthUrbanSAT_bestmodel` 没有读权限，或 `WEIGHTS_REPO` 指错了 |
 | 生成步骤报显存 | Pro 6000 96GB 足够；若 OOM 降低生成并发或 `--gen-seeds 0` |
 | `No checkpoints in weights/lora` | `setup.sh` 没拿到 LoRA，确认 `HF_TOKEN` 有该私有仓库读权限 |
 | DINOv2 下载失败 | 主干通过 `torch.hub` 从 GitHub 拉取，确认服务器可访问外网 |
