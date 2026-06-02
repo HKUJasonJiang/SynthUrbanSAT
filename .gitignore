@@ -1,42 +1,41 @@
-# Checkpoints & Output
-output/
+# Runtime outputs and large assets
+**/output/
+**/cache/
+**/weights/
+**/dataset/
+**/dataset_DFC2018/
+**/dataset_example/
+**/dataset_small/
+**/wandb/
+**/flagged/
+**/gradio_cached_examples/
 
-# Weights (downloaded from HuggingFace)
-weights/
-
-# Dataset (downloaded from HuggingFace)
-dataset/
-
-# Other dataset variants (large image files)
-dataset_DFC2018/
-dataset_example/
-dataset_small/
-
-# Python
-__pycache__/
+# Python environments and caches
+**/__pycache__/
+**/.pytest_cache/
+**/.ipynb_checkpoints/
+**/.venv/
+**/venv/
 *.pyc
 *.pyo
+*.pyd
+*.so
 
-# WandB
-wandb/
-
-# OS
-.DS_Store
-
-# Secrets
+# Secrets and local machine config
 .env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
 
-# Upload script (one-time use)
-_upload_hf.py
-
-# Logs
+# Logs and scratch files
 nohup.out
 *.log
-*.log
+_upload_hf.py
 _upload_remaining.py
-
-# Other (analysis notebooks, scratch files)
 other/
 
-# Version file backups
-scripts/version_file/
+# OS/editor files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+gradio>=4.0
+torch
+torchvision
+safetensors
+transformers>=4.49
+diffusers
+psutil
+numpy
+Pillow
+tifffile
+matplotlib
+huggingface_hub
+python-dotenv

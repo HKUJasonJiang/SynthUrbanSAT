@@ -1,0 +1,22 @@
+# Weights and outputs are pulled by setup.sh / produced at runtime — never commit.
+weights/
+output/
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.ipynb_checkpoints/
+
+# Gradio
+flagged/
+gradio_cached_examples/
+
+# OS
+.DS_Store
+Thumbs.db

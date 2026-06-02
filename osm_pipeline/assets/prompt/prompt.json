@@ -1,0 +1,13 @@
+{
+  "scene": "Aerial top-down satellite view of American urban area",
+  "style": "Google Earth style, 8k resolution, photorealistic satellite imagery, natural daylight",
+  "elements": {
+    "buildings": "detailed rooftops with HVAC units, weathered concrete",
+    "roads": "asphalt streets with lane markings and realistic texture",
+    "vegetation": "lush green trees and grass areas",
+    "ground": "natural earth tones, parking lots, paved surfaces",
+    "water": "reflective surfaces with realistic ripples and color variation"
+  },
+  "lighting": "bright natural daylight, realistic sun shadows, clear visibility",
+  "quality": "masterpiece, raw photo, crisp details, natural color grading"
+}

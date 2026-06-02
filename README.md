@@ -1,146 +1,107 @@
-# HDC²A + Flux.2 ControlNet Training
+# SynthUrbanSAT
 
-Fine-tune a Flux.2 ControlNet with a custom **Heterogeneous Dual-Condition Adapter (HDC²A)** that generates RGB satellite images from segmentation + depth map pairs, conditioned on text embeddings.
+**中文摘要**：SynthUrbanSAT 面向遥感基础模型训练中配对数据稀缺、地域差异大、多样性不足的问题。项目将真实城市布局、程序化三维几何和生成式卫星影像连接起来：先从 OpenStreetMap 生成像素对齐的语义图、深度图和 3D 城市场景，再用 US3D 数据训练 FLUX.2-dev + ControlNet/LoRA，最后把 OSM 生成的 seg/depth 转换为伪真实卫星 RGB。
 
-<p align="center">
-  <img src="docs/architecture.png" width="90%"/>
-</p>
+**English summary**: SynthUrbanSAT is a three-stage pipeline for scalable synthetic urban remote-sensing data. It decouples real-world layout fidelity from image realism: OSM provides geographically grounded urban layouts, the procedural pipeline produces aligned segmentation/depth/3D products, and the generation pipeline uses a trained FLUX.2-dev ControlNet/LoRA model to synthesize realistic satellite RGB images.
 
-## Quick Start (4 Commands)
+## Motivation
+
+Large remote-sensing models need paired, diverse, and geographically varied data. Existing dataset construction has two bottlenecks:
+
+- Manual annotation of RGB satellite images is expensive and slow.
+- Pure procedural rendering with Blender or UE can generate labels, but the rendered RGB is often unrealistic and the procedural city layouts may not follow real-world urban distributions.
+
+OpenStreetMap gives realistic city layout priors, but OSM vectors do not precisely correspond to real RGB satellite pixels. SynthUrbanSAT uses OSM for geometry and semantic/depth supervision, then learns the missing photorealistic RGB appearance with a conditional generative model.
+
+## Repository Layout
+
+```text
+SynthUrbanSAT/
+├── train_pipeline/       # FLUX.2-dev + ControlNet/LoRA training on US3D seg/depth/RGB
+├── osm_pipeline/         # OSM bbox -> aligned 3D mesh, segmentation, depth, metadata
+├── generation_pipeline/  # OSM seg/depth + trained checkpoint -> synthetic satellite RGB
+├── README.md             # this overview
+├── setup.sh              # thin dispatcher; each pipeline also has its own setup
+└── .gitignore            # ignores weights, datasets, cache, outputs, secrets
+```
+
+## Pipeline Story
+
+```text
+Real city layout from OSM
+        |
+        v
+osm_pipeline
+  bbox -> OSM vectors -> 3D mesh / .glb / .blend
+       -> aligned segment map + depth map + metadata
+        |
+        v
+train_pipeline
+  US3D RGB + segment + depth pairs
+       -> train HDC2A + FLUX.2-dev ControlNet/LoRA
+        |
+        v
+generation_pipeline
+  OSM segment + depth + trained checkpoint
+       -> pseudo-realistic satellite RGB
+```
+
+The final dataset keeps semantic and height correspondence from the procedural OSM branch while improving visual realism through conditional image generation.
+
+## Quick Start
+
+Each pipeline is intentionally independent because users may only need one stage.
 
 ```bash
-# 1. Clone & create .env
-git clone https://github.com/HKUJasonJiang/SynthUrbanSAT.git
-cd SynthUrbanSAT
-cp .env.example .env          # fill in HF_TOKEN_READ, HF_TOKEN_WRITE, WANDB_API_KEY
-
-# 2. One-click setup (installs env + downloads data & weights + smoke test)
+# 1. Train FLUX.2-dev ControlNet/LoRA on US3D
+cd train_pipeline
+cp .env.example .env
 bash setup.sh --test-both 0,1,2,3
-
-# 3. Launch all 4 experiments (auto WandB + auto HF upload)
-# refer to the command below
-# bash run.sh
-
-# 4. Monitor
-tmux ls                        # list running experiments
-tmux attach -t exp1            # attach to exp1 (Ctrl-B D to detach)
-watch -n 1 nvidia-smi          # GPU utilization
-```
-
-> `setup.sh` will print the GPU summary at the end (e.g. "8× NVIDIA A100 80GB"). If all checks are green, just `bash run.sh`.
-
-### Single-GPU vs Multi-GPU
-
-```bash
-# Single GPU machine: run.sh will only launch experiments that fit
 bash run.sh
 
-# 8-GPU machine: run.sh launches all 4 experiments concurrently
-bash run.sh
+# 2. Generate OSM-derived seg/depth/3D products
+cd ../osm_pipeline
+bash setup.sh
+python auto_pipeline.py --city omaha_test --bbox -96.135 41.260 -96.130 41.265 --vlm-mode skip --clean
+
+# 3. Generate synthetic satellite RGB from seg/depth
+cd ../generation_pipeline
+bash setup.sh
+python app.py
 ```
 
-### Test Without Training
+For a thin root-level dispatcher:
 
 ```bash
-python train_script.py --test --name smoke_single --no-wandb
-python train_script.py --test-data --name smoke_data --no-wandb
+bash setup.sh train
+bash setup.sh osm
+bash setup.sh generation
 ```
 
-### Override Hyperparameters
+## Data and Weights Policy
 
-```bash
-python train_script.py --name custom_run --batch-size 3 --num-epochs 200 --lora-rank 256
-python train_script.py --name custom_run --milestone-pct 5   # every 5% (default: 10%)
-```
+This repository is designed to stay lightweight on GitHub. The following are intentionally ignored and should be downloaded or generated locally:
 
-### Resume from Checkpoint
+- `**/weights/`: FLUX.2, VAE, text encoder, ControlNet, LoRA/HDC2A checkpoints.
+- `**/dataset/`: US3D and other training datasets.
+- `**/output/`: generated tiles, checkpoints, inference outputs, logs.
+- `**/cache/`: intermediate OSM/geospatial products.
+- `.env*`: HuggingFace and WandB tokens.
 
-```bash
-python train_script.py --name resumed_run --resume output/checkpoint_epoch_0010
-```
+`generation_pipeline/setup.sh` can symlink base FLUX.2 weights from a local ComfyUI installation via `COMFY_MODELS`, while downloading LoRA/HDC2A checkpoints into the ignored `generation_pipeline/weights/` directory.
 
----
+## Pipeline READMEs
 
-## Experiments (8×A100 80GB)
+- [train_pipeline/README.md](train_pipeline/README.md): training data, HDC2A architecture, LoRA/ControlNet training, multi-GPU commands.
+- [osm_pipeline/README.md](osm_pipeline/README.md): OSM-to-3D generation, Blender requirements, tile outputs, CLI and WebUI.
+- [generation_pipeline/README.md](generation_pipeline/README.md): weight setup, Gradio app, batch inference, smoke tests.
 
-All 4 experiments run concurrently via tmux on different GPUs:
+## Hardware Notes
 
-| # | Name | GPUs | BS | Effective BS | Special |
-|---|------|------|----|--------------|---------|
-| 1 | `lora_baseline_4A100_main` | 0,1,2,3 | 12 | 48 | adapter_lr=8e-4 |
-| 2 | `abl_seg_only_2A100` | 4,5 | 6 | 24 | `--disable-depth` |
-| 3 | `lora_rank_256_1A100` | 6 | 3 | 12 | `--lora-rank 256` |
-| 4 | `abl_time_1A100` | 7 | 3 | 12 | `--no-minsnr` |
+- Training and generation are GPU-heavy. The default experiments target A100/H100/H200-class GPUs.
+- OSM processing can run on CPU, but Blender 4.0+ must be available on `PATH` for 3D assembly and rendering.
+- The generation WebUI needs local model weights and enough VRAM to load FLUX.2-dev and ControlNet components.
 
-### Exp 1: Main baseline, MLP, 4×A100 (lora_rank=64, augment, full 1k dataset)
+## Citation
 
-```bash
-tmux new-session -d -s exp1 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=0,1,2,3 ~/miniconda/envs/flux_train/bin/torchrun --nproc_per_node=4 --master_port=29500 train_script.py --name lora_baseline_mlp_4A100_main --adapter_lr 8e-3 --lora_lr 2e-4 --adapter-mlp --augment --batch-size 12 --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
-```
-
-### Exp 2: Seg-only ablation, MLP, 2×A100 (lora_rank=64, full 1k dataset)
-
-```bash
-tmux new-session -d -s exp2 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=4,5 ~/miniconda/envs/flux_train/bin/torchrun --nproc_per_node=2 --master_port=29501 train_script.py --name abl_seg_only_mlp_2A100 --batch-size 6 --disable-depth --adapter_lr 3e-3 --lora_lr 2e-4 --adapter-mlp --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
-```
-
-### Exp 3: LoRA rank 256, MLP, 1×A100 (lora_rank=256, full 1k dataset)
-
-```bash
-tmux new-session -d -s exp3 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=6 ~/miniconda/envs/flux_train/bin/python train_script.py --name lora_rank_256_mlp_1A100 --batch-size 3 --adapter_lr 1e-3 --lora_lr 1e-4 --adapter-mlp --lora-rank 256 --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
-```
-
-### Exp 4: Uniform timestep weight, MLP, 1×A100 (full 1k dataset)
-
-```bash
-tmux new-session -d -s exp4 'cd ~/SynthUrbanSAT && CUDA_VISIBLE_DEVICES=7 ~/miniconda/envs/flux_train/bin/python train_script.py --name abl_time_mlp_1A100 --batch-size 3 --adapter_lr 1e-3 --lora_lr 1e-4 --adapter-mlp --no-minsnr --hf-repo JasonXF/SynthUrbanSAT-Output --seed 42'
-```
-
-### GPU VRAM Reference
-
-| VRAM (GiB) | Recommended batch_size | Notes |
-|---|---:|---|
-| 80 (A100) | 3 | 72488 MiB |
-| 96 (H100) | 4 | 88 GiB used |
-| 140 (H200) | 8 | ~126 / 144 GiB used |
-
-> If OOM, reduce `--batch-size` first; keep effective batch size via higher `--grad-accum-steps`.
-
----
-
-## Overview
-
-| Component | Status | Params |
-|-----------|--------|--------|
-| Flux.2 Transformer backbone | Frozen (FP8) | ~32B |
-| ControlNet control blocks + LoRA | **Trainable** | ~4.1B + 9.8M |
-| HDC²A Adapter | **Trainable** | 52.4M |
-
-- **Input**: segmentation map + depth map + text prompt
-- **Output**: photorealistic satellite RGB image (512×512)
-- **Loss**: flow matching (velocity prediction) with min-SNR weighting
-- **LoRA**: ON by default (rank=32); disable with `--no-lora`
-
----
-
-## Project Structure
-
-```
-├── run.sh              ← Launch all 4 experiments in tmux (one click)
-├── setup.sh            ← One-click environment setup
-├── train_script.py     ← Training entry point
-├── scripts/            ← Training modules (models, data, utils)
-├── docs/
-│   ├── setup_server.md     ← Server deployment, tmux workflow, multi-GPU details
-│   └── ARCHITECTURE.md     ← Detailed architecture & tensor shapes
-└── output/             ← Checkpoints & logs
-```
-
----
-
-## Documentation
-
-| Doc | Description |
-|-----|-------------|
-| **[Server Setup & Multi-GPU Guide](docs/setup_server.md)** | Full server deployment, DDP experiments, tmux workflow, HF upload |
-| **[Architecture Details](docs/ARCHITECTURE.md)** | HDC²A internals, tensor dimensions, VRAM profiling, model loading sequence |
+Citation information will be added after the paper is released.
