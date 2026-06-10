@@ -75,14 +75,14 @@ SCALE_BASE_UNIFORM_HI = 1.3              # main forest tree uniform base hi
 SCALE_XY_OFFSET = 0.15                   # ± offset added to X / Y only
 
 # UI/CLI 0..1 stretch amounts are mapped to these physical multiplier ranges.
-XY_STRETCH_MIN_AT_0 = 0.60
-XY_STRETCH_MIN_AT_1 = 0.90
-XY_STRETCH_MAX_AT_0 = 0.90
-XY_STRETCH_MAX_AT_1 = 2.00
-Z_STRETCH_MIN_AT_0 = 0.45
-Z_STRETCH_MIN_AT_1 = 1.15
-Z_STRETCH_MAX_AT_0 = 0.80
-Z_STRETCH_MAX_AT_1 = 2.40
+XY_STRETCH_MIN_AT_0 = 3.00
+XY_STRETCH_MIN_AT_1 = 3.00
+XY_STRETCH_MAX_AT_0 = 5.00
+XY_STRETCH_MAX_AT_1 = 5.00
+Z_STRETCH_MIN_AT_0 = 0.25
+Z_STRETCH_MIN_AT_1 = 0.25
+Z_STRETCH_MAX_AT_0 = 0.55
+Z_STRETCH_MAX_AT_1 = 0.55
 
 # (2) Slight instance tilt to break low-poly silhouettes.
 TILT_MAX_RAD = 0.1396                    # ~8 deg, applied to instance X & Y
@@ -331,7 +331,7 @@ def _socket_by_name(node, sockets, name):
 
 
 def _build_gn_node_tree(buildings_col, roads_col, water_col, tree_col,
-                        scatter_source_col):
+                        scatter_source_col, scatter_open_land=False):
     """Construct the full Geometry Nodes graph; return the node group."""
     import bpy
 
@@ -461,8 +461,19 @@ def _build_gn_node_tree(buildings_col, roads_col, water_col, tree_col,
     # The host plane still carries the modifier, but only GN instances are
     # output; its own geometry is not used as the distribution mesh unless no
     # foliage substrate exists.
+    #
+    # When ``scatter_open_land`` is set (driven by --allow-non-foliage) we
+    # deliberately distribute on the whole subdivided ground plane so trees
+    # also populate open/vacant land, not just OSM-tagged foliage polygons.
+    # The noise patch mask + building/road/water safe-distance masks still
+    # keep the result a set of natural clumps rather than a uniform carpet.
     scatter_mesh = sock_geom_in
-    if scatter_source_col is not None and len(scatter_source_col.objects) > 0:
+    use_substrate = (
+        not scatter_open_land
+        and scatter_source_col is not None
+        and len(scatter_source_col.objects) > 0
+    )
+    if use_substrate:
         src_info = _new_node(ng, "GeometryNodeCollectionInfo",
                              "CollInfo_ScatterSubstrate", (-1600, 900))
         src_info.transform_space = "RELATIVE"
@@ -787,6 +798,7 @@ def scatter_geometry_nodes(cfg, *, tree_templates,
                            z_stretch_min_at_1=None,
                            z_stretch_max_at_0=None,
                            z_stretch_max_at_1=None,
+                           scatter_open_land=False,
                            seed=0):
     """Build & attach the GN tree-scatter modifier.
 
@@ -811,6 +823,9 @@ def scatter_geometry_nodes(cfg, *, tree_templates,
     obstacle_cols = _build_obstacle_collections()
     scatter_source_col = _build_scatter_source_collection()
     ground = _create_ground_plane(cfg)
+    if scatter_open_land:
+        print("  [GN] scatter_open_land=True -> distributing trees across the "
+              "whole open-land plane (obstacles + noise patches still apply)")
 
     ng = _build_gn_node_tree(
         obstacle_cols["GN_Obstacles_Buildings"],
@@ -818,6 +833,7 @@ def scatter_geometry_nodes(cfg, *, tree_templates,
         obstacle_cols["GN_Obstacles_Water"],
         tree_col,
         scatter_source_col,
+        scatter_open_land=bool(scatter_open_land),
     )
 
     # Idempotent modifier attach.
@@ -952,6 +968,251 @@ def iter_gn_tree_instances(ground_obj):
         yield mw, h, r_xy
 
 
+def _tree_collision_radius_m(r_xy, margin, xy_scale=1.0):
+    try:
+        return max(0.0, float(r_xy) * max(0.0, float(xy_scale)) + float(margin))
+    except Exception:
+        return 0.0
+
+
+def realize_non_colliding_gn_tree_instances(ground_obj, *, margin_m=0.0,
+                                            xy_scale_multiply=1.0,
+                                            min_tree_overlaps=5,
+                                            road_clearance_m=0.0,
+                                            max_tree_height_m=10.0,
+                                            collection_name="GN_Filtered_Trees"):
+    """Convert GN tree instances into real objects, deleting bad placements.
+
+    Cull stages:
+      1. Remove trees whose final XY crown disk intersects building, water, or
+         road geometry. This is a geometry/depth constraint, not only a seg
+         paint-order rule.
+      2. Remove isolated trees whose final crown disk overlaps too few other
+         surviving tree disks. ``min_tree_overlaps=5`` removes trees with 0..5
+         neighbours and keeps trees embedded in clumps.
+    """
+    import bpy
+    from mathutils import Vector
+
+    if ground_obj is None:
+        return {"total": 0, "kept": 0, "removed": 0}
+
+    obstacle_classes = {"building", "water", "road"}
+    bboxes = []
+    for obj in bpy.data.objects:
+        cls = obj.get("class")
+        if obj.type != "MESH" or cls not in obstacle_classes:
+            continue
+        try:
+            xs = [(obj.matrix_world @ Vector(c)).x for c in obj.bound_box]
+            ys = [(obj.matrix_world @ Vector(c)).y for c in obj.bound_box]
+            bboxes.append((min(xs), min(ys), max(xs), max(ys), obj, str(cls)))
+        except Exception:
+            continue
+
+    out_col = bpy.data.collections.get(collection_name)
+    if out_col is None:
+        out_col = bpy.data.collections.new(collection_name)
+        bpy.context.scene.collection.children.link(out_col)
+    else:
+        for obj in list(out_col.objects):
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception:
+                pass
+
+    deps = bpy.context.evaluated_depsgraph_get()
+    removed_by_class = {name: 0 for name in sorted(obstacle_classes)}
+    removed_isolated = 0
+    total = 0
+
+    def collides_mesh(cx, cy, radius):
+        if radius <= 0.0 or not bboxes:
+            return None
+        for minx, miny, maxx, maxy, obj, cls in bboxes:
+            if cx < minx - radius or cx > maxx + radius:
+                continue
+            if cy < miny - radius or cy > maxy + radius:
+                continue
+            try:
+                hit = obj.closest_point_on_mesh(
+                    obj.matrix_world.inverted() @ Vector((cx, cy, 0.0)),
+                    distance=radius)
+                ok = bool(hit[0])
+                if ok:
+                    closest = hit[1]
+                    pt = obj.matrix_world @ closest
+                    dx = float(pt.x) - cx
+                    dy = float(pt.y) - cy
+                    if dx * dx + dy * dy <= radius * radius:
+                        return cls
+            except Exception:
+                dx = 0.0 if minx <= cx <= maxx else min(abs(cx - minx), abs(cx - maxx))
+                dy = 0.0 if miny <= cy <= maxy else min(abs(cy - miny), abs(cy - maxy))
+                if dx * dx + dy * dy <= radius * radius:
+                    return cls
+        return None
+
+    def source_for_matrix(mw):
+        for inst in deps.object_instances:
+            if not inst.is_instance:
+                continue
+            parent = inst.parent
+            if parent is None or parent.original != ground_obj:
+                continue
+            if (inst.matrix_world.translation - mw.translation).length < 1e-5:
+                return inst.object
+        return None
+
+    candidates = []
+    removed_obstacle = 0
+    for mw, h, r_xy in iter_gn_tree_instances(ground_obj):
+        total += 1
+        cx = float(mw.translation.x)
+        cy = float(mw.translation.y)
+        radius = _tree_collision_radius_m(r_xy, margin_m, xy_scale_multiply)
+        hit_class = collides_mesh(cx, cy, radius)
+        if hit_class:
+            removed_obstacle += 1
+            removed_by_class[hit_class] = removed_by_class.get(hit_class, 0) + 1
+            continue
+        src = source_for_matrix(mw)
+        if src is None or src.type != "MESH":
+            removed_obstacle += 1
+            continue
+        src_orig = getattr(src, "original", src)
+        candidates.append({
+            "mw": mw.copy(),
+            "h": float(h),
+            "r_xy": float(r_xy),
+            "cx": cx,
+            "cy": cy,
+            "radius": float(radius),
+            "src": src_orig,
+            "source_template": getattr(src_orig, "name", getattr(src, "name", "")),
+        })
+
+    overlap_threshold = int(min_tree_overlaps or 0)
+    kept_candidates = candidates
+    overlap_counts = [0] * len(candidates)
+    if overlap_threshold > 0 and len(candidates) > 1:
+        max_r = max(c["radius"] for c in candidates) if candidates else 0.0
+        cell = max(1.0, max_r * 2.0)
+        grid = {}
+        for idx, c in enumerate(candidates):
+            key = (int(c["cx"] // cell), int(c["cy"] // cell))
+            grid.setdefault(key, []).append(idx)
+        seen_pairs = set()
+        for key, ids in grid.items():
+            kx, ky = key
+            nearby = []
+            for ox in (-1, 0, 1):
+                for oy in (-1, 0, 1):
+                    nearby.extend(grid.get((kx + ox, ky + oy), []))
+            for i in ids:
+                ci = candidates[i]
+                for j in nearby:
+                    if j <= i:
+                        continue
+                    pair = (i, j)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    cj = candidates[j]
+                    dx = ci["cx"] - cj["cx"]
+                    dy = ci["cy"] - cj["cy"]
+                    rr = ci["radius"] + cj["radius"]
+                    if dx * dx + dy * dy <= rr * rr:
+                        overlap_counts[i] += 1
+                        overlap_counts[j] += 1
+        kept_candidates = []
+        for c, n in zip(candidates, overlap_counts):
+            c["overlap_count"] = int(n)
+            if n <= overlap_threshold:
+                removed_isolated += 1
+                continue
+            kept_candidates.append(c)
+
+    kept = 0
+    for c in kept_candidates:
+        src = c["src"]
+        mesh = src.data.copy()
+        mesh.name = f"filtered_tree_mesh_{kept:05d}"
+        new_obj = bpy.data.objects.new(f"filtered_tree_{kept:05d}", mesh)
+        mw = c["mw"].copy()
+        effective_h = float(c["h"])
+        try:
+            max_h = float(max_tree_height_m or 0.0)
+        except Exception:
+            max_h = 0.0
+        def _scale_world_z(matrix, ratio):
+            matrix[2][0] *= ratio
+            matrix[2][1] *= ratio
+            matrix[2][2] *= ratio
+
+        if max_h > 0.0 and effective_h > max_h:
+            z_ratio = max_h / max(1e-6, effective_h)
+            # Scale the world-Z contribution of the instance matrix so the
+            # exported mesh, render depth, and recorded tree_h_m all use the
+            # same capped vertical height even when the template is rotated.
+            _scale_world_z(mw, z_ratio)
+            effective_h = max_h
+        new_obj.matrix_world = mw
+        if max_h > 0.0:
+            try:
+                zs = [(new_obj.matrix_world @ Vector(corner)).z
+                      for corner in new_obj.bound_box]
+                actual_h = float(max(zs) - min(zs))
+            except Exception:
+                actual_h = effective_h
+            if actual_h > max_h:
+                mw = new_obj.matrix_world.copy()
+                _scale_world_z(mw, max_h / max(1e-6, actual_h))
+                new_obj.matrix_world = mw
+                effective_h = max_h
+            else:
+                effective_h = actual_h
+        new_obj["is_tree_instance"] = True
+        new_obj["class"] = "foliage"
+        new_obj["class_id"] = 2
+        new_obj["source_template"] = str(c.get("source_template", ""))
+        new_obj["tree_h_m"] = float(effective_h)
+        new_obj["tree_r_xy_m"] = float(c["r_xy"])
+        new_obj["tree_overlap_count"] = int(c.get("overlap_count", 0))
+        new_obj.pass_index = 2
+        out_col.objects.link(new_obj)
+        kept += 1
+
+    ground_obj.hide_render = True
+    ground_obj.hide_viewport = True
+    try:
+        ground_obj.modifiers[GN_MODIFIER_NAME].show_render = False
+        ground_obj.modifiers[GN_MODIFIER_NAME].show_viewport = False
+    except Exception:
+        pass
+    src_col = bpy.data.collections.get(TREE_COLLECTION_NAME)
+    if src_col is not None:
+        for obj in src_col.objects:
+            obj.hide_render = True
+            obj.hide_viewport = True
+    bpy.context.view_layer.update()
+    removed = removed_obstacle + removed_isolated
+    print(f"  [GN] obstacle/isolation filter: kept {kept}/{total} trees, "
+          f"removed {removed} obstacle={removed_by_class} "
+          f"isolated={removed_isolated} "
+          f"(min_overlaps>{overlap_threshold}, "
+          f"xy_scale={float(xy_scale_multiply):.2f}x, "
+          f"max_h={float(max_tree_height_m or 0.0):.2f}m, "
+          f"margin={float(margin_m):.2f}m)")
+    return {"total": total, "kept": kept, "removed": removed,
+            "removed_by_class": removed_by_class,
+            "removed_isolated": removed_isolated,
+            "min_tree_overlaps": overlap_threshold,
+            "obstacle_classes": sorted(obstacle_classes),
+            "xy_scale_multiply": float(xy_scale_multiply),
+            "max_tree_height_m": float(max_tree_height_m or 0.0),
+            "margin_m": float(margin_m)}
+
 def dump_gn_tree_instances_json(cfg, ground_obj, out_path):
     """Write a ``tree_instances.json`` compatible with the legacy schema
     used by ``auto_pipeline.py``: ``{ortho_m, trees: [{x_centered, y_centered, h}]}``.
@@ -974,9 +1235,10 @@ def dump_gn_tree_instances_json(cfg, ground_obj, out_path):
         })
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps({
-        "ortho_m": ortho_m,
-        "trees": trees,
-    }))
+    payload = {"ortho_m": ortho_m, "trees": trees}
+    if cfg.get("tree_building_collision_filter"):
+        payload["tree_building_collision_filter"] = cfg.get(
+            "tree_building_collision_filter")
+    out_path.write_text(json.dumps(payload))
     print(f"  [GN] dumped {len(trees)} tree instances -> {out_path.name}")
     return len(trees)

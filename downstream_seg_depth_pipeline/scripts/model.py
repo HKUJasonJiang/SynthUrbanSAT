@@ -6,6 +6,7 @@ Height (AGL) -> per-pixel height in metres [B, 1, H, W] (ReLU, >= 0)
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from scripts.backbone import DINOv2Backbone
 from scripts.heads import DPTHead, LinearHead
@@ -41,8 +42,8 @@ class ProbeModel(nn.Module):
         feats = self.backbone(x)
         out = self.head(feats, out_hw)
         if self.task == "height":
-            # Predict normalized height in [0, 1] then rescale to metres.
-            out = torch.sigmoid(out) * self.ndsm_max_m
+            # Positive metre-scale regression without saturating at zero or capping tall objects.
+            out = F.softplus(out)
         return out
 
     def trainable_parameters(self):

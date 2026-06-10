@@ -17,6 +17,7 @@ data-scaling curves from a single config.
 
 import os
 import random
+import json
 
 import numpy as np
 import torch
@@ -38,12 +39,38 @@ def _read_height_metres(path: str) -> np.ndarray:
         arr = _read_exr(path)
     else:
         img = Image.open(path)
-        arr = np.array(img, dtype=np.float32)
+        raw = np.array(img)
+        enc = _find_depth_encoding(path) if ext == ".png" else None
+        if enc and np.issubdtype(raw.dtype, np.integer):
+            nodata = enc.get("nodata")
+            scale = float(enc.get("scale", 1.0))
+            offset_m = float(enc.get("offset_m", 0.0))
+            arr = raw.astype(np.float32)
+            if nodata is not None:
+                arr = np.where(raw == int(nodata), np.nan, arr)
+            arr = arr / scale + offset_m
+        else:
+            arr = raw.astype(np.float32)
     if arr.ndim == 3:
         arr = arr[..., 0]
     # Non-finite (sky / no-data) -> NaN so metrics ignore it.
     arr = np.where(np.isfinite(arr), arr, np.nan).astype(np.float32)
     return arr
+
+
+def _find_depth_encoding(path: str) -> dict | None:
+    p = os.path.abspath(path)
+    cur = os.path.dirname(p)
+    for _ in range(4):
+        cand = os.path.join(cur, "depth_encoding.json")
+        if os.path.isfile(cand):
+            with open(cand) as f:
+                return json.load(f)
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
 
 
 def _read_exr(path: str) -> np.ndarray:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import warnings
 from pathlib import Path
@@ -210,19 +211,24 @@ def build_class_mesh(class_name: str, geom_local, cfg: dict,
                     h_tag = item.get("height_tag")
                     l_tag = item.get("levels_tag")
                     h = None
+
+                    def _finite_float(value):
+                        try:
+                            v = float(str(value).split()[0].replace("m", ""))
+                        except Exception:  # noqa: BLE001
+                            return None
+                        return v if math.isfinite(v) else None
+
                     # Prefer explicit OSM height tag (handles "12", "12 m",
                     # "12.5"). Fall back to building:levels * meters_per_level.
-                    if h_tag:
-                        try:
-                            h = float(str(h_tag).split()[0].replace("m", ""))
-                        except Exception:  # noqa: BLE001
-                            h = None
-                    if h is None and l_tag:
-                        try:
-                            h = float(l_tag) * meters_per_level
-                        except Exception:  # noqa: BLE001
-                            h = None
+                    h_val = _finite_float(h_tag)
+                    if h_val is not None:
+                        h = h_val
                     if h is None:
+                        lvl_val = _finite_float(l_tag)
+                        if lvl_val is not None:
+                            h = lvl_val * meters_per_level
+                    if h is None or not math.isfinite(float(h)):
                         h = _sample_building_height(rng, height_dist,
                                                      hmin, hmax)
                     h = max(0.5, float(h))

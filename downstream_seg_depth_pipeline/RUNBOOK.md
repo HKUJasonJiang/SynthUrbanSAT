@@ -38,7 +38,7 @@ cd SynthUrbanSAT/downstream_seg_depth_pipeline
 conda activate flux_train
 
 # 提供 HF token（必填）
-export HF_TOKEN=hf_xxxxxxxxxxxxxxxxx
+export HF_TOKEN=<your_hf_token>
 
 # 权重默认从 JasonXF/SynthUrbanSAT_bestmodel 下载，通常不用额外设置。
 # 如需覆盖到别的 repo，再设置：

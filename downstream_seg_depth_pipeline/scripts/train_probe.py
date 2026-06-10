@@ -10,11 +10,12 @@ variable (see configs/default.yaml and scripts/data.py).
 
 import argparse
 import os
+import time
 
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 
 from scripts.data import TileDataset, build_mixture, resolve_synth_root
 from scripts.evaluate import evaluate
@@ -26,12 +27,46 @@ def _seg_loss(logits, target, ignore_index):
     return F.cross_entropy(logits, target, ignore_index=ignore_index)
 
 
-def _height_loss(pred, target):
+def _height_loss(pred, target, scale_m=25.0, positive_weight=4.0, positive_threshold_m=1.0):
     target = target.to(pred.dtype)
     mask = torch.isfinite(target)
     if mask.sum() == 0:
         return pred.sum() * 0.0
-    return F.l1_loss(pred[mask], target[mask])
+    scale = max(float(scale_m), 1e-6)
+    err = torch.abs(pred[mask] / scale - target[mask] / scale)
+    weights = torch.ones_like(err)
+    weights = weights + float(positive_weight) * (target[mask] > float(positive_threshold_m)).to(err.dtype)
+    return (err * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+def _height_mse(pred, target):
+    target = target.to(pred.dtype)
+    mask = torch.isfinite(target)
+    if mask.sum() == 0:
+        return None
+    return torch.mean((pred[mask] - target[mask]) ** 2).detach().float().item()
+
+
+def _training_split_names(cfg):
+    splits = cfg.get("data", {}).get("train_splits", ["train"])
+    if isinstance(splits, str):
+        splits = [splits]
+    return splits or ["train"]
+
+
+def _build_train_dataset(cfg, real_root, synth_root, label_space, image_size, task):
+    parts = []
+    for split in _training_split_names(cfg):
+        part = build_mixture(
+            real_split_dir=os.path.join(real_root, split),
+            synth_split_dir=os.path.join(synth_root, split),
+            label_space=label_space, image_size=image_size, task=task,
+            real_fraction=cfg["data"]["real_fraction"],
+            synth_count=cfg["data"]["synth_count"],
+            seed=cfg["seed"],
+        )
+        parts.append(part)
+    return parts[0] if len(parts) == 1 else ConcatDataset(parts)
 
 
 def train_one(cfg, device):
@@ -41,14 +76,7 @@ def train_one(cfg, device):
 
     real_root = cfg["data"]["real_root"]
     synth_root = resolve_synth_root(cfg)
-    train_ds = build_mixture(
-        real_split_dir=os.path.join(real_root, "train"),
-        synth_split_dir=os.path.join(synth_root, "train"),
-        label_space=ls, image_size=s, task=task,
-        real_fraction=cfg["data"]["real_fraction"],
-        synth_count=cfg["data"]["synth_count"],
-        seed=cfg["seed"],
-    )
+    train_ds = _build_train_dataset(cfg, real_root, synth_root, ls, s, task)
     test_ds = TileDataset(os.path.join(real_root, "test"), ls, s, task)
 
     tcfg = cfg["train"]
@@ -64,13 +92,18 @@ def train_one(cfg, device):
         freeze_backbone=cfg["backbone"]["freeze"], ndsm_max_m=cfg["ndsm_max_m"],
     ).to(device)
 
-    opt = torch.optim.AdamW(model.trainable_parameters(), lr=tcfg["lr"],
+    lr = tcfg.get("height_lr", tcfg["lr"]) if task == "height" else tcfg["lr"]
+    opt = torch.optim.AdamW(model.trainable_parameters(), lr=lr,
                             weight_decay=tcfg["weight_decay"])
     scaler = torch.cuda.amp.GradScaler(enabled=tcfg["amp"] and device.type == "cuda")
 
+    history = {"train_loss": [], "train_mse_m2": []}
+    start_time = time.time()
     for epoch in range(tcfg["epochs"]):
         model.train()
         running = 0.0
+        mse_running = 0.0
+        mse_count = 0
         for batch in train_loader:
             rgb = batch["rgb"].to(device, non_blocking=True)
             opt.zero_grad(set_to_none=True)
@@ -79,18 +112,34 @@ def train_one(cfg, device):
                 if task == "segmentation":
                     loss = _seg_loss(out, batch["seg"].to(device), cfg["ignore_index"])
                 else:
-                    loss = _height_loss(out.squeeze(1), batch["height"].to(device).squeeze(1))
+                    loss = _height_loss(
+                        out.squeeze(1), batch["height"].to(device).squeeze(1), cfg["ndsm_max_m"],
+                        tcfg.get("height_positive_weight", 4.0),
+                        tcfg.get("height_positive_threshold_m", 1.0),
+                    )
+                    mse = _height_mse(out.squeeze(1), batch["height"].to(device).squeeze(1))
+                    if mse is not None:
+                        mse_running += mse
+                        mse_count += 1
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
             running += loss.item()
-        print(f"[epoch {epoch+1}/{tcfg['epochs']}] loss={running/max(len(train_loader),1):.4f}")
+        epoch_loss = running / max(len(train_loader), 1)
+        history["train_loss"].append(epoch_loss)
+        if task == "height":
+            history["train_mse_m2"].append(mse_running / max(mse_count, 1))
+        print(f"[epoch {epoch+1}/{tcfg['epochs']}] loss={epoch_loss:.4f}")
 
     metrics = evaluate(model, test_loader, device, cfg["num_classes"],
                        cfg["ignore_index"], cfg["eval"]["height_threshold_m"],
                        dump_dir=cfg["eval"].get("dump_dir"),
                        dump_n=cfg["eval"].get("dump_n", 0),
                        palette_rgb=ls.rgb, ndsm_max_m=cfg["ndsm_max_m"])
+    metrics["history"] = history
+    metrics["train_seconds"] = time.time() - start_time
+    metrics["train_size"] = len(train_ds)
+    metrics["train_splits"] = _training_split_names(cfg)
     print(f"[test] {metrics}")
     return model, metrics
 

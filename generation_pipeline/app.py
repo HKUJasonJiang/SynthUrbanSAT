@@ -707,6 +707,283 @@ def build_ui():
     return demo
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CLI compare mode for paper figures
+# ═════════════════════════════════════════════════════════════════════════════
+
+NEAR_NADIR_RE = __import__('re').compile(r'^near[-_]nadir[-_](\d+)$', __import__('re').IGNORECASE)
+
+
+def _tile_sort_key(path: Path):
+    import math as _math
+    import re as _re
+    m = _re.search(r'(\d+)$', path.name)
+    return (int(m.group(1)) if m else _math.inf, path.name)
+
+
+def _discover_tile_dirs(input_dir: Path) -> list[Path]:
+    return sorted(
+        (p for p in input_dir.iterdir() if p.is_dir() and p.name.startswith('tile_')),
+        key=_tile_sort_key,
+    )
+
+
+def _discover_near_dirs(tile_dir: Path) -> list[Path]:
+    dirs = [p for p in tile_dir.iterdir() if p.is_dir() and NEAR_NADIR_RE.match(p.name)]
+    return sorted(dirs, key=lambda p: int(NEAR_NADIR_RE.match(p.name).group(1)))
+
+
+def _parse_batch_arg(batch: str | None) -> tuple[int | None, int | None]:
+    if not batch:
+        return None, None
+    parts = [x.strip() for x in batch.split(',')]
+    if len(parts) != 2 or not all(parts):
+        raise ValueError('--compare-batch must look like START,END, e.g. 0,10')
+    start, end = int(parts[0]), int(parts[1])
+    if start < 0 or end < start:
+        raise ValueError('--compare-batch expects 0 <= START <= END')
+    return start, end
+
+
+def _selected_compare_tiles(input_dir: Path, args) -> list[Path]:
+    tiles = _discover_tile_dirs(input_dir)
+    if args.compare_tile_names:
+        wanted = set(args.compare_tile_names)
+        tiles = [t for t in tiles if t.name in wanted]
+    start, end = _parse_batch_arg(args.compare_batch)
+    if start is not None:
+        tiles = tiles[start:end]
+    if args.compare_random_tiles:
+        import random as _random
+        rng = _random.Random(args.compare_random_seed)
+        n = min(int(args.compare_random_tiles), len(tiles))
+        tiles = sorted(rng.sample(tiles, n), key=_tile_sort_key)
+    return tiles
+
+
+def _replace_suffix(name: str, suffix: str) -> str:
+    return str(Path(name).with_suffix(suffix))
+
+
+def _compare_paths(tile_dir: Path, args) -> tuple[str, Path, Path, Path | None]:
+    depth_suffix = '.exr' if args.compare_depth_exr else '.png'
+    if args.compare_near_nadir is not None:
+        view = f'near-nadir-{args.compare_near_nadir}'
+        view_dir = tile_dir / view
+        seg_path = view_dir / args.compare_sub_seg_name
+        depth_path = view_dir / _replace_suffix(args.compare_sub_depth_name, depth_suffix)
+    elif args.compare_near_nadir_random:
+        import random as _random
+        near_dirs = _discover_near_dirs(tile_dir)
+        if not near_dirs:
+            raise FileNotFoundError(f'no near-nadir-* dirs under {tile_dir}')
+        tile_key = _tile_sort_key(tile_dir)[0]
+        tile_seed = int(tile_key) if tile_key != float('inf') else abs(hash(tile_dir.name))
+        view_dir = _random.Random(args.compare_random_seed + tile_seed).choice(near_dirs)
+        view = view_dir.name
+        seg_path = view_dir / args.compare_sub_seg_name
+        depth_path = view_dir / _replace_suffix(args.compare_sub_depth_name, depth_suffix)
+    else:
+        view = 'root'
+        seg_path = tile_dir / args.compare_seg_name
+        depth_path = tile_dir / _replace_suffix(args.compare_depth_name, depth_suffix)
+    rgb_path = tile_dir / args.compare_rgb_name
+    return view, seg_path, depth_path, rgb_path if rgb_path.exists() else None
+
+
+def _save_compare_png(arr: np.ndarray, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.asarray(arr)
+    if arr.dtype != np.uint8:
+        arr = arr.clip(0, 255).astype(np.uint8)
+    Image.fromarray(arr[..., :3]).save(path)
+
+
+@torch.no_grad()
+def run_compare_one(tile_dir: Path, args, prompt_embed: torch.Tensor, out_root: Path) -> dict:
+    from pipeline.inference import sample_ours, sample_baseline
+
+    view, seg_path, depth_path, rgb_path = _compare_paths(tile_dir, args)
+    for label, path in (('seg', seg_path), ('depth', depth_path)):
+        if not path.exists():
+            raise FileNotFoundError(f'missing {label}: {path}')
+
+    STATE.reload_ours_if_dropped(persistent_text_encoder=True)
+
+    size = STATE.image_size
+    seed = int(args.compare_seed)
+    seg = preprocess_seg(str(seg_path), size, STATE.num_classes)
+    depth = preprocess_depth(str(depth_path), size) if depth_path.suffix.lower() != '.exr' else _load_compare_exr(depth_path, size)
+    seg_rgb = seg_to_rgb(seg, STATE.seg_palette)
+    depth_rgb = depth_to_rgb(depth)
+    osm_rgb = _to_uint8(preprocess_rgb(str(rgb_path), size)) if rgb_path else None
+
+    prompt_B = prompt_embed.to(DEVICE, DTYPE).unsqueeze(0)
+
+    STATE.lora_enable(True)
+    ours_rgb, ctrl_ctx = sample_ours(
+        seg.unsqueeze(0), depth.unsqueeze(0), prompt_B,
+        num_steps=int(args.compare_steps), guidance_scale=float(args.compare_cfg),
+        seeds=[seed], progress=None,
+    )
+    synth_rgb = _to_uint8(ours_rgb[0])
+    feature_rgb = feature_heatmap(ctrl_ctx, size)
+
+    STATE.lora_enable(False)
+    nolora_rgb, _ = sample_ours(
+        seg.unsqueeze(0), depth.unsqueeze(0), prompt_B,
+        num_steps=int(args.compare_steps), guidance_scale=float(args.compare_cfg),
+        seeds=[seed], progress=None,
+    )
+    nolora_rgb = _to_uint8(nolora_rgb[0])
+    STATE.lora_enable(True)
+
+    STATE.load_baseline()
+    seg_rgb_tensor = torch.from_numpy(seg_rgb).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+    depth_rgb_tensor = torch.from_numpy(depth_rgb).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+    base_seg_rgb = sample_baseline(
+        seg_rgb_tensor, prompt_B,
+        num_steps=int(args.compare_steps), guidance_scale=float(args.compare_cfg),
+        seeds=[seed], label='compare-seg-only',
+    )
+    base_depth_rgb = sample_baseline(
+        depth_rgb_tensor, prompt_B,
+        num_steps=int(args.compare_steps), guidance_scale=float(args.compare_cfg),
+        seeds=[seed], label='compare-depth-only',
+    )
+    base_seg_rgb = _to_uint8(base_seg_rgb[0])
+    base_depth_rgb = _to_uint8(base_depth_rgb[0])
+
+    depth_tag = 'exr' if args.compare_depth_exr else 'png'
+    out_dir = out_root / tile_dir.name / view / f'depth_{depth_tag}' / f'seed_{seed:04d}'
+    images = {
+        'osm_rgb': osm_rgb,
+        'seg': seg_rgb,
+        'depth': depth_rgb,
+        'hdc2a_feature': feature_rgb,
+        'synth_rgb': synth_rgb,
+        'without_lora': nolora_rgb,
+        'seg_only': base_seg_rgb,
+        'depth_only': base_depth_rgb,
+    }
+    for name, arr in images.items():
+        if arr is not None:
+            _save_compare_png(arr, out_dir / f'{name}.png')
+
+    grid = build_panel_grid(
+        [('OSM sat RGB', osm_rgb), ('Seg', seg_rgb), ('Depth', depth_rgb),
+         ('HDC2A feature', feature_rgb), ('Synth RGB', synth_rgb),
+         ('Without LoRA', nolora_rgb), ('Seg only', base_seg_rgb), ('Depth only', base_depth_rgb)],
+        thumb=280,
+        title=f'{tile_dir.name}/{view} seed={seed}',
+    )
+    _save_compare_png(grid, out_dir / 'grid.png')
+
+    metadata = {
+        'tile': tile_dir.name,
+        'view': view,
+        'seed': seed,
+        'depth_tag': depth_tag,
+        'seg_path': str(seg_path),
+        'depth_path': str(depth_path),
+        'osm_rgb_path': str(rgb_path) if rgb_path else None,
+        'outputs': {name: str(out_dir / f'{name}.png') for name, arr in images.items() if arr is not None},
+        'grid': str(out_dir / 'grid.png'),
+        'num_steps': int(args.compare_steps),
+        'cfg': float(args.compare_cfg),
+        'checkpoint': STATE.ckpt_dir.name if STATE.ckpt_dir else None,
+    }
+    (out_dir / 'metadata.json').write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
+    return metadata
+
+
+def _load_compare_exr(path: Path, size: int) -> torch.Tensor:
+    import OpenEXR
+    with OpenEXR.File(str(path)) as f:
+        channels = f.channels()
+        key = 'V' if 'V' in channels else next(iter(channels))
+        arr = channels[key].pixels.astype(np.float32)
+    while arr.ndim > 2:
+        arr = arr[..., 0] if arr.shape[-1] <= arr.shape[0] else arr[0]
+    if np.isinf(arr).any():
+        finite = arr[np.isfinite(arr)]
+        arr = np.where(np.isinf(arr), float(finite.max()) if finite.size else 0.0, arr)
+    arr = np.nan_to_num(arr, nan=0.0)
+    if arr.shape != (size, size):
+        arr = np.array(Image.fromarray(arr).resize((size, size), Image.LANCZOS), dtype=np.float32)
+    mn, mx = float(arr.min()), float(arr.max())
+    arr = (arr - mn) / (mx - mn) if mx > mn else np.zeros_like(arr, dtype=np.float32)
+    return torch.from_numpy(arr).unsqueeze(0)
+
+
+def run_compare_cli(args) -> int:
+    input_dir = Path(args.compare_osm_dir).expanduser().resolve()
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f'--compare-osm-dir not found: {input_dir}')
+    if args.compare_near_nadir is not None and args.compare_near_nadir_random:
+        raise ValueError('Use only one of --compare-near-nadir and --compare-near-nadir-random')
+
+    missing = verify_base_weights()
+    if missing:
+        raise FileNotFoundError(f'Missing base weights: {missing}')
+
+    if args.compare_ckpt:
+        ckpt_dir = (_HERE / 'weights' / 'lora' / args.compare_ckpt).resolve()
+        if not (ckpt_dir / 'meta.pt').is_file():
+            raise FileNotFoundError(f'checkpoint not found: {ckpt_dir}')
+    else:
+        ckpts = list_lora_checkpoints()
+        if not ckpts:
+            raise FileNotFoundError('No checkpoints under weights/lora')
+        ckpt_dir = ckpts[0]
+
+    out_root = (Path(args.compare_out).expanduser().resolve() if args.compare_out
+                else OUTPUT_DIR / f'{input_dir.name}-compare')
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    STATE.load(ckpt_dir, persistent_text_encoder=True)
+    prompt_text_json = Path(args.compare_prompt_json).expanduser().read_text()
+    _LAST_PROMPT_JSON['text'] = prompt_text_json
+    prompt_embed, flat_prompt, msg = encode_prompt_ui(prompt_text_json)
+    if prompt_embed is None:
+        raise RuntimeError(msg)
+    print(msg)
+
+    if not args.compare_tile_names and not args.compare_batch and not args.compare_random_tiles:
+        raise ValueError('Compare mode needs a tile selection: use --compare-tile-names, --compare-batch, or --compare-random-tiles')
+
+    tiles = _selected_compare_tiles(input_dir, args)
+    if not tiles:
+        raise RuntimeError('No selected tile folders')
+
+    results = []
+    for i, tile_dir in enumerate(tiles, start=1):
+        print(f'[{i}/{len(tiles)}] compare {tile_dir.name}')
+        try:
+            results.append(run_compare_one(tile_dir, args, prompt_embed, out_root))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print(f'  [ERR] {tile_dir.name}: {e}')
+
+    manifest = {
+        'input_dir': str(input_dir),
+        'checkpoint': str(ckpt_dir),
+        'flat_prompt': flat_prompt,
+        'out_root': str(out_root),
+        'tile_names': args.compare_tile_names,
+        'batch': args.compare_batch,
+        'random_tiles': int(args.compare_random_tiles),
+        'seed': int(args.compare_seed),
+        'num_steps': int(args.compare_steps),
+        'cfg': float(args.compare_cfg),
+        'items': results,
+    }
+    (out_root / 'manifest_compare.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
+    print(f'Done. Compare outputs: {out_root}')
+    return 0
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 PERSISTENT_TEXT_ENCODER = True
 
@@ -719,9 +996,45 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', 7860)))
     parser.add_argument('--host', type=str, default='0.0.0.0')
     parser.add_argument('--share', action='store_true')
+
+    # Non-WebUI paper-figure compare mode.
+    parser.add_argument('--compare-osm-dir', default=None,
+                        help='Run compare mode on an OSM output folder instead of launching WebUI')
+    parser.add_argument('--compare-tile-names', nargs='+', default=[],
+                        help='Specific tile folders for compare mode, e.g. tile_0001 tile_0002')
+    parser.add_argument('--compare-batch', default=None,
+                        help='Half-open sorted tile range START,END for compare mode')
+    parser.add_argument('--compare-random-tiles', type=int, default=0,
+                        help='Randomly sample this many tiles for compare mode after tile/batch filtering')
+    parser.add_argument('--compare-near-nadir', type=int, default=None,
+                        help='Use fixed near-nadir-N view for compare mode')
+    parser.add_argument('--compare-near-nadir-random', action='store_true',
+                        help='Choose one near-nadir-* view per tile for compare mode')
+    parser.add_argument('--compare-random-seed', type=int, default=0)
+    parser.add_argument('--compare-depth-exr', action='store_true')
+    parser.add_argument('--compare-seed', type=int, default=0,
+                        help='Single seed to use for paper compare figures')
+    parser.add_argument('--compare-steps', type=int, default=28)
+    parser.add_argument('--compare-cfg', type=float, default=3.5)
+    parser.add_argument('--compare-ckpt', default=None)
+    parser.add_argument('--compare-prompt-json', default=str(DEFAULT_PROMPT_JSON))
+    parser.add_argument('--compare-out', default=None)
+    parser.add_argument('--compare-rgb-name', default='2_rgb.png')
+    parser.add_argument('--compare-seg-name', default='4_seg.png')
+    parser.add_argument('--compare-depth-name', default='5_depth.png')
+    parser.add_argument('--compare-sub-seg-name', default='1_seg.png')
+    parser.add_argument('--compare-sub-depth-name', default='2_depth.png')
     args = parser.parse_args()
 
     PERSISTENT_TEXT_ENCODER = not args.no_textencoder
+
+    if args.compare_osm_dir:
+        try:
+            sys.exit(run_compare_cli(args))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print(f'❌ compare failed: {e}')
+            sys.exit(1)
 
     missing = verify_base_weights()
     if missing:

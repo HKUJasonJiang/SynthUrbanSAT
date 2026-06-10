@@ -319,6 +319,7 @@ def fetch_classes_wgs(bbox):
             out["foliage"] = None
             out["_buildings_with_id"] = None
             edges = fetch_roads_local(region_dir, bbox, road_keep)
+            out["_road_edges"] = edges
             if edges is not None and len(edges) > 0:
                 out["road"] = kr1._buffer_road_edges(
                     edges, bbox, CFG["osm"]["road_buffer_m"], road_keep)
@@ -366,6 +367,7 @@ def fetch_classes_wgs(bbox):
 
         # Buffer road LineStrings -> WGS84 polygon, mirrors KR1 path.
         edges = bundle.get("_road_edges")
+        out["_road_edges"] = edges
         if edges is not None and len(edges) > 0:
             out["road"] = kr1._buffer_road_edges(
                 edges, bbox, CFG["osm"]["road_buffer_m"], road_keep)
@@ -566,10 +568,15 @@ def on_save(state, city_name, blend_path: str | None = None):
 
 
 # Path to the Blender executable used by KR3 build. Override with env var
-# ``BLENDER_EXE`` if your install lives elsewhere.
+# ``BLENDER_EXE`` if your install lives elsewhere. Prefer the local Blender
+# 5.x install because the tree assets are saved in Blender 5 format.
 import os as _os
+import shutil as _shutil
+_DEFAULT_BLENDER_5 = "/data/home/jason/blender_dl/blender-5.0.1-linux-x64/blender"
 BLENDER_EXE = _os.environ.get(
-    "BLENDER_EXE", r"C:\Softwares\blender\blender.exe"
+    "BLENDER_EXE",
+    _DEFAULT_BLENDER_5 if Path(_DEFAULT_BLENDER_5).exists()
+    else (_shutil.which("blender") or r"C:\Softwares\blender\blender.exe"),
 )
 
 
@@ -853,8 +860,8 @@ def _run_kr3(city: str, scatter_seed: int, tree_density: float,
              *, species: list | None = None,
              tree_h_dist: str = "lognormal",
              tree_h_seed: int = 11,
-             tree_h_min: float = 3.0,
-             tree_h_max: float = 14.0,
+             tree_h_min: float = 6.0,
+             tree_h_max: float = 10.0,
              canopy_npz: str | None = None,
              show_foliage_substrate: bool = False,
              scatter_mode: str = "canopy_prob",
@@ -873,8 +880,8 @@ def _run_kr3(city: str, scatter_seed: int, tree_density: float,
              cluster_overlap_factor: float = 0.45,
              cluster_min_keep_ratio: float = 0.6,
              cluster_min_size_abs: int = 0,
-             topdown_tree_xy_scale: float = 1.0,
-             gn_tree_amount: float = 0.5,
+             topdown_tree_xy_scale: float = 1.8,
+             gn_tree_amount: float = 0.25,
              gn_safe_building: float = 2.5,
              gn_safe_road: float = 3.0,
              gn_safe_water: float = 2.0,
@@ -882,14 +889,14 @@ def _run_kr3(city: str, scatter_seed: int, tree_density: float,
              gn_min_distance: float = 3.5,
              gn_xy_stretch: float = 0.75,
              gn_z_stretch: float = 0.5,
-             gn_xy_stretch_min_at_0: float = 0.60,
-             gn_xy_stretch_min_at_1: float = 0.90,
-             gn_xy_stretch_max_at_0: float = 0.90,
-             gn_xy_stretch_max_at_1: float = 4.00,
-             gn_z_stretch_min_at_0: float = 0.45,
-             gn_z_stretch_min_at_1: float = 1.15,
-             gn_z_stretch_max_at_0: float = 0.80,
-             gn_z_stretch_max_at_1: float = 2.40,
+             gn_xy_stretch_min_at_0: float = 3.00,
+             gn_xy_stretch_min_at_1: float = 3.00,
+             gn_xy_stretch_max_at_0: float = 5.00,
+             gn_xy_stretch_max_at_1: float = 5.00,
+             gn_z_stretch_min_at_0: float = 0.25,
+             gn_z_stretch_min_at_1: float = 0.25,
+             gn_z_stretch_max_at_0: float = 0.55,
+             gn_z_stretch_max_at_1: float = 0.55,
              uniform_tree_scale: bool = True,
              render_depth: bool = True):
     """Run KR3 (Blender headless) on an existing ``{city}.glb``.
@@ -1194,7 +1201,7 @@ def on_rescatter_trees(state, city_name, scatter_seed, tree_density,
                         tree_h_min, tree_h_max,
                         canopy_source, canopy_local_path,
                         scatter_mode="canopy_prob",
-                        allow_non_foliage=True,
+                        allow_non_foliage=False,
                         enable_street_trees=False,
                         canopy_prob_scale=1.0,
                         procedural_augment_ratio=0.0,
@@ -1268,8 +1275,9 @@ def build_ui():
     # defer it so import order is safe).
     from auto_pipeline import (
         AutoPipeline, AutoPipelineConfig, STAGES, STAGE_NAMES,
-        aggregate_city,
-        rerun_trees_only, run_single_tile,
+        aggregate_city, filter_tile_plans, load_master_plan,
+        parse_tile_range, rerun_trees_only, run_single_tile,
+        save_master_plan,
     )
     from dataprep.tile_grid import plan_tiles, grid_shape
     from dataprep.geometry_utils import (
@@ -1492,7 +1500,7 @@ def build_ui():
                 0.0, 1.0, value=0.25, step=0.05,
                 label="Green Area Size  (--target-foliage-ratio)  控制整体绿色面积")
             d["gn_tree_amount"] = gr.Slider(
-                0.0, 1.0, value=0.5, step=0.05,
+                0.0, 1.0, value=0.25, step=0.05,
                 label="Tree Density in Green Area  (--gn-tree-amount)  控制绿色区域内树木数量/密度")
             d["tree_density"] = gr.Number(
                 value=0.00015, visible=False, label="legacy tree_density")
@@ -1505,14 +1513,14 @@ def build_ui():
                     label="Tree Z Stretch  (--gn-z-stretch)  0=不拉伸, 1=使用下面 Z Min/Max")
             with gr.Row():
                 d["gn_xy_stretch_min"] = gr.Number(
-                    value=0.90, label="XY Stretch Min")
+                    value=3.00, label="XY Stretch Min")
                 d["gn_xy_stretch_max"] = gr.Number(
-                    value=4.00, label="XY Stretch Max")
+                    value=5.00, label="XY Stretch Max")
             with gr.Row():
                 d["gn_z_stretch_min"] = gr.Number(
-                    value=1.15, label="Z Stretch Min")
+                    value=0.25, label="Z Stretch Min")
                 d["gn_z_stretch_max"] = gr.Number(
-                    value=2.40, label="Z Stretch Max")
+                    value=0.55, label="Z Stretch Max")
             with gr.Accordion("高级树木参数（通常不用改）", open=False):
                 d["scatter_seed"] = gr.Number(
                     value=11, precision=0, label="Random Seed  (--scatter-seed)")
@@ -1537,7 +1545,7 @@ def build_ui():
                         0.5, 12.0, value=3.5, step=0.5,
                         label="Tree Min Distance  (--gn-min-distance) [m]")
                     d["topdown_tree_xy_scale"] = gr.Slider(
-                        0.5, 6.0, value=1.0, step=0.1,
+                        0.5, 6.0, value=1.8, step=0.1,
                         label="Topdown XY Inflate  (--topdown-tree-xy-scale)")
                 species_init = _scan_tree_species_dir()
                 d["tree_species"] = gr.CheckboxGroup(
@@ -1554,7 +1562,7 @@ def build_ui():
         d["tree_h_dist"] = gr.Textbox(value="lognormal", visible=False)
         d["tree_h_seed"] = gr.Number(value=11, precision=0, visible=False)
         d["tree_h_min"] = gr.Number(value=6.0, visible=False)
-        d["tree_h_max"] = gr.Number(value=20.0, visible=False)
+        d["tree_h_max"] = gr.Number(value=10.0, visible=False)
         d["tree_height_low_frac"] = gr.Number(value=0.65, visible=False)
         d["cluster_size_min"] = gr.Number(value=10, precision=0, visible=False)
         d["cluster_size_max"] = gr.Number(value=20, precision=0, visible=False)
@@ -1569,7 +1577,7 @@ def build_ui():
         # 🎨 Render / global --------------------------------------- #
         with gr.Accordion("🎨 渲染 & 全局", open=False):
             d["use_blender_seg"] = gr.Checkbox(
-                value=False,
+                value=True,
                 visible=False,
                 label="use_blender_seg  (--use-blender-seg)")
             with gr.Row():
@@ -1642,13 +1650,13 @@ def build_ui():
             gn_min_distance=float(vals["gn_min_distance"]),
             gn_xy_stretch=float(vals["gn_xy_stretch"]),
             gn_z_stretch=float(vals["gn_z_stretch"]),
-            gn_xy_stretch_min_at_0=1.0,
+            gn_xy_stretch_min_at_0=xy_min,
             gn_xy_stretch_min_at_1=xy_min,
-            gn_xy_stretch_max_at_0=1.0,
+            gn_xy_stretch_max_at_0=xy_max,
             gn_xy_stretch_max_at_1=xy_max,
-            gn_z_stretch_min_at_0=1.0,
+            gn_z_stretch_min_at_0=z_min,
             gn_z_stretch_min_at_1=z_min,
-            gn_z_stretch_max_at_0=1.0,
+            gn_z_stretch_max_at_0=z_max,
             gn_z_stretch_max_at_1=z_max,
             use_blender_seg=bool(vals["use_blender_seg"]),
             canopy_source=str(vals["canopy_source"]),
@@ -2213,14 +2221,25 @@ def build_ui():
 
             with gr.Row():
                 t2_estimate_btn = gr.Button("📐 Estimate grid")
+                t2_save_plan_btn = gr.Button("💾 Save Master Plan")
                 t2_run_btn = gr.Button(
                     "🚀 Generate All tiles (= auto_pipeline CLI)",
                     variant="primary", size="lg")
                 t2_rerun_trees_btn = gr.Button(
                     "🌳 Regenerate Trees Only for existing tiles",
                     variant="secondary", size="lg")
+            with gr.Row():
+                t2_plan_path = gr.Textbox(
+                    value="",
+                    label="master plan path  (留空 = output/<city>/metadata/tile_plan.json)")
+                t2_tile_range = gr.Textbox(
+                    value="0001:1000",
+                    label="tile range for staged generation")
+                t2_run_range_btn = gr.Button(
+                    "🚀 Generate Tile Range from Plan",
+                    variant="primary")
             t2_estimate = gr.Textbox(label="estimate",
-                                       interactive=False, lines=4)
+                                       interactive=False, lines=6)
             t2_log = gr.Textbox(label="批量进度",
                                   interactive=False, lines=18)
             with gr.Row():
@@ -2345,9 +2364,55 @@ def build_ui():
                         f"~wall: B+C+D ≈ {len(plans)*2}s, "
                         f"E+F ≈ {len(plans)*40}s")
 
+            def _default_plan_path(city: str) -> Path:
+                city_clean = (city or "ui_batch_city").strip().replace(
+                    "/", "_").replace(" ", "_")
+                return ROOT / "output" / city_clean / "metadata" / "tile_plan.json"
+
+            def _resolve_plan_path(city: str, plan_path: str | None) -> Path:
+                text = (plan_path or "").strip()
+                if not text:
+                    return _default_plan_path(city)
+                raw = Path(text).expanduser()
+                # A bare name like "omaha-960" means
+                # output/omaha-960/metadata/tile_plan.json. A path ending in
+                # .json is treated as an explicit file path. A directory-like
+                # path gets metadata/tile_plan.json appended.
+                if raw.suffix.lower() == ".json":
+                    return raw
+                if raw.parent == Path("."):
+                    safe = text.replace("/", "_").replace("\\", "_").replace(" ", "_")
+                    return ROOT / "output" / safe / "metadata" / "tile_plan.json"
+                return raw / "metadata" / "tile_plan.json"
+
+            def _t2_save_plan(c1, c2, city, overlap, plan_path):
+                if not c1 or not c2:
+                    return "pick NW + SE corners first."
+                Nl, Wl = c1; Sl, El = c2
+                bbox = (Wl, Sl, El, Nl)
+                city_clean = (city or "ui_batch_city").strip().replace(
+                    "/", "_").replace(" ", "_")
+                plans = plan_tiles(bbox, gsd=0.5, size_px=1024,
+                                   overlap=float(overlap))
+                out = _resolve_plan_path(city_clean, plan_path)
+                saved = save_master_plan(city_clean, bbox, plans, out,
+                                         gsd=0.5, size_px=1024,
+                                         overlap=float(overlap))
+                nr, nc = grid_shape(plans)
+                approx_gb = len(plans) * 16.0 / 1024.0
+                return (f"saved master plan: {saved}\n"
+                        f"grid = {nr} x {nc} = {len(plans)} tiles\n"
+                        f"bbox = {tuple(round(x, 6) for x in bbox)}\n"
+                        f"approx output = {approx_gb:.1f} GB")
+
             t2_estimate_btn.click(
                 _t2_estimate,
                 [t2_corner1, t2_corner2, t2_panel["overlap"]],
+                [t2_estimate])
+            t2_save_plan_btn.click(
+                _t2_save_plan,
+                [t2_corner1, t2_corner2, t2_city,
+                 t2_panel["overlap"], t2_plan_path],
                 [t2_estimate])
 
             # ---- Tab 2: Generate All ---- #
@@ -2431,6 +2496,100 @@ def build_ui():
             t2_run_btn.click(
                 _t2_generate_all,
                 [t2_corner1, t2_corner2, t2_city] + t2_panel_components,
+                [t2_log, t2_city_sat, t2_city_seg])
+
+            def _t2_generate_range(plan_path, tile_range_text, city, *panel_vals):
+                plan_file = _resolve_plan_path(city, plan_path)
+                if not plan_file.exists():
+                    yield f"master plan not found: {plan_file}\n先框选 NW/SE，然后点 Save Master Plan。", None, None
+                    return
+                ui_t0 = _time.time()
+                ui_started_at = _time.strftime("%Y-%m-%d %H:%M:%S")
+                vals = dict(zip(t2_panel_keys, panel_vals))
+                city_clean = (city or "ui_batch_city").strip().replace(
+                    "/", "_").replace(" ", "_")
+                try:
+                    master_plans = load_master_plan(plan_file)
+                    selected = filter_tile_plans(
+                        master_plans, parse_tile_range(tile_range_text))
+                except Exception as e:
+                    yield f"failed to load plan/range: {type(e).__name__}: {e}", None, None
+                    return
+                if not selected:
+                    yield f"tile range selected 0 tiles: {tile_range_text}", None, None
+                    return
+                area_bbox = area_bbox_union(master_plans)
+                cfg = _cfg_from_panel(city_clean, area_bbox, vals)
+                cfg.tile_plans = master_plans
+                cfg.tile_range = parse_tile_range(tile_range_text)
+                tracker = _ProgressTracker(n_tiles=len(selected))
+                pipe = AutoPipeline(cfg, progress_cb=tracker.cb)
+                holder = {}
+
+                def _bg():
+                    try:
+                        pipe.plan(force_clean=False)
+                        holder["s"] = pipe.run()
+                    except Exception as e:
+                        import traceback
+                        holder["err"] = (
+                            f"{type(e).__name__}: {e}\n"
+                            + traceback.format_exc()[-1500:])
+
+                th = threading.Thread(target=_bg, daemon=True); th.start()
+                yield (f"running from plan... {len(selected)} / {len(master_plans)} tiles\n"
+                       f"plan: {plan_file}\nrange: {tile_range_text}\n"
+                       + tracker.render(), None, None)
+                while th.is_alive():
+                    _time.sleep(1.5)
+                    yield (f"running from plan... {len(selected)} / {len(master_plans)} tiles\n"
+                           f"plan: {plan_file}\nrange: {tile_range_text}\n"
+                           + tracker.render(), None, None)
+                th.join()
+                if "err" in holder:
+                    yield (f"FAILED: {holder['err']}\n" + tracker.render(),
+                           None, None)
+                    return
+                summary = holder.get("s", {})
+                ui_duration = _time.time() - ui_t0
+                city_dir = ROOT / "output" / city_clean
+                try:
+                    meta_dir = city_dir / "metadata"
+                    meta_dir.mkdir(parents=True, exist_ok=True)
+                    ui_timing = {
+                        "city": city_clean,
+                        "source": "osm_app_tab2_generate_tile_range",
+                        "plan_path": str(plan_file),
+                        "tile_range": tile_range_text,
+                        "started_at": ui_started_at,
+                        "ended_at": _time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "duration_sec": round(float(ui_duration), 3),
+                        "duration_min": round(float(ui_duration) / 60.0, 3),
+                        "n_tiles_selected": len(selected),
+                        "n_tiles_master": len(master_plans),
+                        "auto_pipeline_timing_path": summary.get("timing_path"),
+                    }
+                    (meta_dir / "ui_run_timing_latest.json").write_text(
+                        json.dumps(ui_timing, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+                except Exception as e:
+                    print(f"[ui] failed to write UI timing: {e}", flush=True)
+                sat_p = city_dir / "city_overview_satellite.png"
+                seg_p = city_dir / "city_overview_seg.png"
+                if not sat_p.exists():
+                    sat_p = city_dir / f"{city_clean}_rgb.png"
+                if not seg_p.exists():
+                    seg_p = city_dir / f"{city_clean}_seg.png"
+                yield (f"DONE in {ui_duration:.1f}s "
+                       f"({ui_duration / 60.0:.2f} min)\n"
+                       f"{json.dumps(summary, indent=2)}\n\n"
+                       + tracker.render(),
+                       str(sat_p) if sat_p.exists() else None,
+                       str(seg_p) if seg_p.exists() else None)
+
+            t2_run_range_btn.click(
+                _t2_generate_range,
+                [t2_plan_path, t2_tile_range, t2_city] + t2_panel_components,
                 [t2_log, t2_city_sat, t2_city_seg])
 
             def _t2_rerun_trees(c1, c2, city, *panel_vals):

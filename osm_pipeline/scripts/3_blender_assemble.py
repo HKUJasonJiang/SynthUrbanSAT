@@ -168,6 +168,76 @@ def _list_buildings():
             if o.type == "MESH" and o.get("class") == "building"]
 
 
+def _cap_tree_object_world_height(obj, max_height_m):
+    """Clamp a realized tree mesh's world-space bbox height in-place."""
+    import math
+    from mathutils import Vector
+    try:
+        max_h = float(max_height_m or 0.0)
+    except Exception:
+        max_h = 0.0
+    if not math.isfinite(max_h) or max_h <= 0.0:
+        return False
+    try:
+        mw = obj.matrix_world.copy()
+        inv = mw.inverted()
+        world_vertices = [mw @ v.co for v in obj.data.vertices]
+        zs = [p.z for p in world_vertices]
+        min_z = float(min(zs))
+        actual_h = float(max(zs) - min_z)
+    except Exception:
+        return False
+    if not math.isfinite(actual_h) or actual_h <= max_h:
+        try:
+            obj["tree_h_m"] = float(actual_h)
+        except Exception:
+            pass
+        return False
+    ratio = max_h / max(1e-6, actual_h)
+    for vert, world_co in zip(obj.data.vertices, world_vertices):
+        world_co.z = min_z + (float(world_co.z) - min_z) * ratio
+        vert.co = inv @ world_co
+    try:
+        obj.data.update()
+    except Exception:
+        pass
+    try:
+        obj["tree_h_m"] = float(max_h)
+    except Exception:
+        pass
+    return True
+
+
+def _tree_height_cap_from_cfg(cfg):
+    try:
+        return float((cfg.get("tree_building_collision_filter") or {}).get(
+            "max_tree_height_m") or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _cap_all_realized_tree_heights(cfg, label="tree height cap"):
+    import bpy
+    max_h = _tree_height_cap_from_cfg(cfg)
+    if max_h <= 0.0:
+        return 0
+    capped = 0
+    for obj in bpy.data.objects:
+        if obj.type != "MESH" or not bool(obj.get("is_tree_instance")):
+            continue
+        if bool(obj.get("is_gn_ground")) or obj.hide_render:
+            continue
+        if _cap_tree_object_world_height(obj, max_h):
+            capped += 1
+    if capped:
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+        print(f"[KR3] {label}: height-capped {capped} realized trees to {max_h:.2f}m")
+    return capped
+
+
 def _dump_tree_instances_json(cfg, out_path):
     """Dump positions of all `is_tree_instance` objects to JSON.
 
@@ -196,9 +266,10 @@ def _dump_tree_instances_json(cfg, out_path):
         x_local = float(obj.location.x)
         y_local = float(obj.location.y)
         try:
-            xs = [(obj.matrix_world @ Vector(c)).x for c in obj.bound_box]
-            ys = [(obj.matrix_world @ Vector(c)).y for c in obj.bound_box]
-            zs = [(obj.matrix_world @ Vector(c)).z for c in obj.bound_box]
+            world_vertices = [obj.matrix_world @ v.co for v in obj.data.vertices]
+            xs = [p.x for p in world_vertices]
+            ys = [p.y for p in world_vertices]
+            zs = [p.z for p in world_vertices]
             h = float(max(zs) - min(zs))
             r_xy = 0.5 * float(max(max(xs) - min(xs), max(ys) - min(ys)))
         except Exception:
@@ -211,10 +282,11 @@ def _dump_tree_instances_json(cfg, out_path):
             "r_xy_m": r_xy,
         })
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps({
-        "ortho_m": ortho_m,
-        "trees": trees,
-    }))
+    payload = {"ortho_m": ortho_m, "trees": trees}
+    if cfg.get("tree_building_collision_filter"):
+        payload["tree_building_collision_filter"] = cfg.get(
+            "tree_building_collision_filter")
+    out_path.write_text(json.dumps(payload))
     print(f"  [KR3] dumped {len(trees)} tree instances -> {out_path.name}")
 
 
@@ -676,7 +748,7 @@ def _render_topdown_shader_depth_png(cfg, out_png):
 
 def _render_preview_png(cfg, out_png, class_ids, iso_png=None,
                          hide_foliage_substrate=True,
-                         topdown_tree_xy_scale=1.0,
+                         topdown_tree_xy_scale=1.8,
                          depth_exr=None, depth_png=None):
     """Render top-down RGB PNG (and optionally an isometric/3D PNG).
 
@@ -843,11 +915,40 @@ def _render_preview_png(cfg, out_png, class_ids, iso_png=None,
             print(f"[KR3] top-view: GN topdown XY inflate = {sxy:.2f}x "
                   f"(PERMANENT — seg & .blend will match 1:1)")
 
+            n_real_scaled = 0
+            n_real_height_capped = 0
+            try:
+                tree_max_h = float((cfg.get("tree_building_collision_filter")
+                                    or {}).get("max_tree_height_m") or 0.0)
+            except Exception:
+                tree_max_h = 0.0
+            for obj in bpy.data.objects:
+                if obj.type != "MESH" or not bool(obj.get("is_tree_instance")):
+                    continue
+                if bool(obj.get("is_gn_ground")) or obj.hide_render:
+                    continue
+                obj.scale.x *= sxy
+                obj.scale.y *= sxy
+                n_real_scaled += 1
+                if _cap_tree_object_world_height(obj, tree_max_h):
+                    n_real_height_capped += 1
+            if n_real_scaled:
+                try:
+                    bpy.context.view_layer.update()
+                except Exception:
+                    pass
+                msg = (f"[KR3] top-view: scaled {n_real_scaled} realized tree "
+                       f"objects in XY by {sxy:.2f}x")
+                if n_real_height_capped:
+                    msg += (f"; height-capped {n_real_height_capped} back to "
+                            f"{tree_max_h:.2f}m")
+                print(msg)
     out_png = Path(out_png)
     out_png.parent.mkdir(parents=True, exist_ok=True)
     scn.render.filepath = str(out_png)
     bpy.ops.render.render(write_still=True)
     print(f"[KR3] preview PNG saved -> {out_png}")
+    _cap_all_realized_tree_heights(cfg, label="pre-depth tree height cap")
 
     # Restore visibility for the depth pass, iso render and any downstream measurement.
     for obj in _hidden_substrate:
@@ -1006,8 +1107,9 @@ def _sample_surface_pointcloud(cfg, target_count=50000, voxel_size=0.5, seed=123
             continue
         if bool(source_obj.get("is_gn_ground")):
             continue
-        if (not instance.is_instance) and bool(source_obj.get("is_tree_instance")):
-            continue
+        # Realized post-filter tree objects are non-instanced and should
+        # participate in pointcloud sampling; hidden template trees are
+        # skipped above by hide_render.
 
         local_tris = _mesh_local_triangles(source_obj, depsgraph, mesh_cache)
         if local_tris is None or len(local_tris) == 0:
@@ -1612,16 +1714,28 @@ def main():
     ap.add_argument("--preview-glb", default=None,
                     help="if set, export a coloured tree-enriched GLB "
                          "for browser preview")
-    ap.add_argument("--topdown-tree-xy-scale", type=float, default=3.5,
+    ap.add_argument("--topdown-tree-xy-scale", type=float, default=1.8,
                     help="multiplier applied to tree-instance X/Y scale "
                          "during the top-down RGB pass only (Z unchanged). "
-                         "Default 3.5 makes per-tile canopy read like a "
+                         "Default 1.8 makes per-tile canopy read like a "
                          "remote-sensing tree-segmentation patch. Set to "
                          "1.0 to disable.")
-    ap.add_argument("--gn-tree-amount", type=float, default=0.5,
-                    help="0..1 GN density control; 0.5 = default density")
+    ap.add_argument("--gn-tree-amount", type=float, default=0.25,
+                    help="0..1 GN density control; 0.25 = denser tuned default")
     ap.add_argument("--gn-safe-building", type=float, default=None,
                     help="GN safe distance from building geometry in metres")
+    ap.add_argument("--tree-building-collision", dest="tree_building_collision",
+                    action="store_true", default=True,
+                    help="delete GN tree instances whose crown disk intersects building geometry")
+    ap.add_argument("--no-tree-building-collision", dest="tree_building_collision",
+                    action="store_false",
+                    help="disable post-GN tree/building crown collision deletion")
+    ap.add_argument("--tree-building-margin", type=float, default=0.0,
+                    help="extra metres added to tree crown radius for building collision deletion")
+    ap.add_argument("--tree-min-overlap-count", type=int, default=3,
+                    help="delete tree crowns overlapping this many or fewer other tree crowns; 0 disables isolation filtering")
+    ap.add_argument("--tree-road-clearance", type=float, default=3.0,
+                    help="delete trees whose centre is within this many metres of road geometry")
     ap.add_argument("--gn-safe-road", type=float, default=None,
                     help="GN safe distance from road geometry in metres")
     ap.add_argument("--gn-safe-water", type=float, default=None,
@@ -1789,8 +1903,19 @@ def main():
                 z_stretch_min_at_1=args.gn_z_stretch_min_at_1,
                 z_stretch_max_at_0=args.gn_z_stretch_max_at_0,
                 z_stretch_max_at_1=args.gn_z_stretch_max_at_1,
+                scatter_open_land=bool(args.allow_non_foliage),
                 seed=int(scatter_seed),
             )
+            if gn_ground_obj is not None and bool(args.tree_building_collision):
+                stats = gn.realize_non_colliding_gn_tree_instances(
+                    gn_ground_obj,
+                    margin_m=float(args.tree_building_margin or 0.0),
+                    xy_scale_multiply=float(args.topdown_tree_xy_scale or 1.0),
+                    min_tree_overlaps=int(args.tree_min_overlap_count or 0),
+                    road_clearance_m=float(args.tree_road_clearance or 0.0),
+                    max_tree_height_m=float(args.tree_height_max or 0.0))
+                cfg["tree_building_collision_filter"] = stats
+                gn_ground_obj = None
 
     if not args.no_clutter:
         _add_roof_clutter(rng)
@@ -1832,6 +1957,8 @@ def main():
         except Exception as e:
             print(f"[KR3] pointcloud export failed: {e}")
 
+    _cap_all_realized_tree_heights(cfg, label="pre-dump tree height cap")
+
     # Dump tree instance positions while scene is still in tile-corner
     # coords — this lets the pipeline composite trees in mercator with
     # zero pixel-level resampling error. With the GN scatter, instance
@@ -1851,7 +1978,9 @@ def main():
     except Exception as e:
         print(f"[KR3] tree dump failed: {e}")
 
+    _cap_all_realized_tree_heights(cfg, label="pre-save tree height cap")
     _prepare_blend_for_user(cfg)
+    _cap_all_realized_tree_heights(cfg, label="post-prepare tree height cap")
     if args.preview_glb:
         try:
             _export_scene_glb_for_web(args.preview_glb)

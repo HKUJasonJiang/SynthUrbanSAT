@@ -82,9 +82,19 @@ def preprocess_depth(path: str, size: int) -> torch.Tensor:
         arr = _load_array_tiff(path).astype(np.float32)
     else:
         img = Image.open(path)
-        if img.mode != 'F':
+        enc = _find_depth_encoding(path)
+        if enc is not None:
+            raw = np.array(img)
+            arr = raw.astype(np.float32)
+            nodata = enc.get('nodata')
+            if nodata is not None and np.issubdtype(raw.dtype, np.integer):
+                arr = np.where(raw == int(nodata), np.nan, arr)
+            arr = arr / float(enc.get('scale', 1.0)) + float(enc.get('offset_m', 0.0))
+        elif img.mode != 'F':
             img = img.convert('L') if img.mode != 'L' else img
-        arr = np.array(img, dtype=np.float32)
+            arr = np.array(img, dtype=np.float32)
+        else:
+            arr = np.array(img, dtype=np.float32)
 
     while arr.ndim > 2:
         arr = arr[..., 0] if arr.shape[-1] <= arr.shape[0] else arr[0]
@@ -93,9 +103,28 @@ def preprocess_depth(path: str, size: int) -> torch.Tensor:
         arr_pil = Image.fromarray(arr).resize((size, size), Image.LANCZOS)
         arr = np.array(arr_pil, dtype=np.float32)
 
-    mn, mx = float(arr.min()), float(arr.max())
-    arr = (arr - mn) / (mx - mn) if mx > mn else np.zeros_like(arr)
+    finite = np.isfinite(arr)
+    if np.any(finite):
+        mn, mx = float(arr[finite].min()), float(arr[finite].max())
+        out = np.zeros_like(arr, dtype=np.float32)
+        if mx > mn:
+            out[finite] = (arr[finite] - mn) / (mx - mn)
+        arr = out
+    else:
+        arr = np.zeros_like(arr, dtype=np.float32)
     return torch.from_numpy(arr).unsqueeze(0)
+
+
+def _find_depth_encoding(path: str) -> dict | None:
+    cur = Path(path).resolve().parent
+    for _ in range(4):
+        cand = cur / 'depth_encoding.json'
+        if cand.is_file():
+            return json.loads(cand.read_text())
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return None
 
 
 def preprocess_rgb(path: str, size: int) -> torch.Tensor:

@@ -81,9 +81,20 @@ def main():
     ap.add_argument("--ckpt", default=None,
                     help="checkpoint dir name under generation_pipeline/weights/lora")
     ap.add_argument("--prompt-json", default=None)
+    ap.add_argument("--prompt-embed", default=None,
+                    help="precomputed prompt embedding .pt; skips loading the text encoder")
     ap.add_argument("--limit", type=int, default=0, help="only first N tiles (debug)")
+    ap.add_argument("--num-shards", type=int, default=1,
+                    help="split tile list into this many deterministic shards")
+    ap.add_argument("--shard-index", type=int, default=0,
+                    help="which shard to generate, in [0, num_shards)")
     ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
+
+    if args.num_shards < 1:
+        raise SystemExit("--num-shards must be >= 1")
+    if not (0 <= args.shard_index < args.num_shards):
+        raise SystemExit("--shard-index must be in [0, num_shards)")
 
     _ensure_gen_on_path()
     # Imports from the generation pipeline (need weights + flux_train env).
@@ -111,10 +122,17 @@ def main():
         ckpt_dir = cks[0]
     print(f"[gen] checkpoint: {ckpt_dir.name}")
 
-    STATE.load(ckpt_dir, persistent_text_encoder=True)
-    prompt_path = args.prompt_json or str(DEFAULT_PROMPT_JSON)
-    prompt_text = compose_prompt_from_json(json.loads(Path(prompt_path).read_text()))
-    prompt_embed = encode_prompt(prompt_text)
+    STATE.load(ckpt_dir, persistent_text_encoder=(args.prompt_embed is None))
+    if args.prompt_embed:
+        prompt_embed = torch.load(args.prompt_embed, map_location="cpu", weights_only=True)
+        if prompt_embed.ndim == 3 and prompt_embed.shape[0] == 1:
+            prompt_embed = prompt_embed[0]
+        if prompt_embed.ndim != 2:
+            raise SystemExit(f"prompt embedding must have shape [seq, dim], got {tuple(prompt_embed.shape)}")
+    else:
+        prompt_path = args.prompt_json or str(DEFAULT_PROMPT_JSON)
+        prompt_text = compose_prompt_from_json(json.loads(Path(prompt_path).read_text()))
+        prompt_embed = encode_prompt(prompt_text)
 
     size = STATE.image_size
     nc = STATE.num_classes
@@ -122,7 +140,10 @@ def main():
     stems = _list_stems(real_split)
     if args.limit > 0:
         stems = stems[: args.limit]
-    print(f"[gen] {len(stems)} real tiles -> {out_split}  (seeds={args.seeds})")
+    total_stems = len(stems)
+    stems = stems[args.shard_index::args.num_shards]
+    shard_label = f" shard={args.shard_index}/{args.num_shards}" if args.num_shards > 1 else ""
+    print(f"[gen] {len(stems)}/{total_stems} real tiles -> {out_split}  (seeds={args.seeds}){shard_label}")
 
     done = 0
     for stem in stems:

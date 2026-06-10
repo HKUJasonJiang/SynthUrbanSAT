@@ -25,6 +25,7 @@ TEST_PREFIXES="JAX"            # hold out Jacksonville for test (US3D has JAX/OM
 GEN_SEEDS="0"                  # synthetic RGBs per tile (1 seed == same count as real)
 TRAIN_SEEDS="0 1 2"
 GEN_LIMIT="0"                  # >0 = only generate first N tiles (smoke test)
+GEN_CKPT=""                    # optional checkpoint dir under generation_pipeline/weights/lora
 REAL_ROOT="../train_pipeline/dataset"
 SYNTH_ROOT="./dataset_synth_us3d"
 
@@ -33,6 +34,7 @@ while [[ $# -gt 0 ]]; do
         --us3d-dir)       US3D_DIR="$2"; shift 2;;
         --test-prefixes)  TEST_PREFIXES="$2"; shift 2;;
         --gen-seeds)      GEN_SEEDS="$2"; shift 2;;
+        --gen-ckpt)       GEN_CKPT="$2"; shift 2;;
         --train-seeds)    TRAIN_SEEDS="$2"; shift 2;;
         --gen-limit)      GEN_LIMIT="$2"; shift 2;;
         --real-root)      REAL_ROOT="$2"; shift 2;;
@@ -42,18 +44,41 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$US3D_DIR" ]] || { echo "ERROR: --us3d-dir is required" >&2; exit 1; }
 
-echo "==[1/3] Splitting US3D (test holdout: $TEST_PREFIXES) =="
-python scripts/make_splits.py \
-    --src "$US3D_DIR" --out "$REAL_ROOT" \
-    --test-prefixes $TEST_PREFIXES --val-fraction 0.1 --seed 0
+if [[ -d "$US3D_DIR/train/rgb" && -d "$US3D_DIR/val/rgb" && -d "$US3D_DIR/test/rgb" ]]; then
+    echo "==[1/3] Using pre-split US3D root: $US3D_DIR =="
+    REAL_ROOT="$US3D_DIR"
+else
+    echo "==[1/3] Splitting US3D (test holdout: $TEST_PREFIXES) =="
+    python scripts/make_splits.py \
+        --src "$US3D_DIR" --out "$REAL_ROOT" \
+        --test-prefixes $TEST_PREFIXES --val-fraction 0.1 --seed 0
+fi
 
 echo "==[2/3] Generating synthetic S_p from real train seg+depth =="
 GEN_ARGS=(--real-split "$REAL_ROOT/train" --out-split "$SYNTH_ROOT/train" --seeds $GEN_SEEDS)
 [[ "$GEN_LIMIT" != "0" ]] && GEN_ARGS+=(--limit "$GEN_LIMIT")
+[[ -n "$GEN_CKPT" ]] && GEN_ARGS+=(--ckpt "$GEN_CKPT")
+[[ -f "$REAL_ROOT/prompt.json" ]] && GEN_ARGS+=(--prompt-json "$REAL_ROOT/prompt.json")
 python scripts/gen_synth_from_real.py "${GEN_ARGS[@]}"
 
 echo "==[3/3] Training R vs S probes (seg + height) and plotting =="
+mkdir -p output/phase1
+RUN_CONFIG="output/phase1/config.resolved.yaml"
+python - "configs/default.yaml" "$RUN_CONFIG" "$REAL_ROOT" "$SYNTH_ROOT" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+src, dst, real_root, synth_root = sys.argv[1:]
+cfg = yaml.safe_load(Path(src).read_text())
+cfg["data"]["real_root"] = real_root
+cfg["data"].setdefault("synth_sources", {})["us3d_paired"] = synth_root
+Path(dst).write_text(yaml.safe_dump(cfg, sort_keys=False))
+print(f"[config] {dst}")
+PY
 python -m experiments.run_phase1 \
+    --config "$RUN_CONFIG" \
     --tasks segmentation height \
     --seeds $TRAIN_SEEDS \
     --synth-source us3d_paired

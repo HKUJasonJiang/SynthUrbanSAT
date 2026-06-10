@@ -21,8 +21,9 @@ TAG_QUERIES: dict[str, dict] = {
         "natural": ["grassland", "heath"],
     },
     "water": {
-        "natural": ["water", "bay", "strait", "coastline"],
-        "waterway": ["river", "stream", "canal", "riverbank"],
+        # Avoid coastline and linear waterway centre-lines as polygons.
+        "natural": ["water", "bay", "strait"],
+        "waterway": ["riverbank"],
         "landuse": ["reservoir", "basin"],
     },
     "building": {

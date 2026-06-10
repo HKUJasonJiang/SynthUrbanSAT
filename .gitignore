@@ -6,6 +6,7 @@
 **/dataset_DFC2018/
 **/dataset_example/
 **/dataset_small/
+**/dataset_synth_us3d/
 **/wandb/
 **/flagged/
 **/gradio_cached_examples/
@@ -15,6 +16,7 @@
 **/.pytest_cache/
 **/.ipynb_checkpoints/
 **/.venv/
+**/.venv-*/
 **/venv/
 *.pyc
 *.pyo

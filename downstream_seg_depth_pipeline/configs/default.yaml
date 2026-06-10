@@ -45,6 +45,7 @@ train:
   epochs: 50
   batch_size: 8
   lr: 1.0e-3
+  height_lr: 1.0e-4
   weight_decay: 1.0e-4
   num_workers: 4
   amp: true

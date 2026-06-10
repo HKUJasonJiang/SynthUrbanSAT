@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import builtins
 import sys
+import re
+import threading
 
 _orig_print = builtins.print
 
@@ -84,6 +86,62 @@ warnings.filterwarnings("ignore", category=UserWarning, module="shapely")
 warnings.filterwarnings("ignore", message=".*GeoSeries.notna.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*'mode' parameter is deprecated.*")
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class _TeeStream:
+    """Write console output to the original stream and a plain-text log."""
+
+    def __init__(self, stream, log_file, lock: threading.Lock):
+        self._stream = stream
+        self._log_file = log_file
+        self._lock = lock
+        self.encoding = getattr(stream, "encoding", "utf-8")
+
+    def write(self, text):
+        with self._lock:
+            self._stream.write(text)
+            self._log_file.write(_ANSI_RE.sub("", text))
+
+    def flush(self):
+        with self._lock:
+            self._stream.flush()
+            self._log_file.flush()
+
+    def isatty(self):
+        return getattr(self._stream, "isatty", lambda: False)()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+
+@contextmanager
+def _live_log_to_file(city: str, path: str | Path | None = None,
+                      enabled: bool = True):
+    """Mirror stdout/stderr into output/<city>/metadata/run_live.log."""
+    if not enabled:
+        yield None
+        return
+    log_path = Path(path) if path else (
+        ROOT / "output" / city / "metadata" / "run_live.log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = threading.Lock()
+    orig_stdout, orig_stderr = sys.stdout, sys.stderr
+    with open(log_path, "a", encoding="utf-8", buffering=1) as log_file:
+        log_file.write("\n" + "=" * 78 + "\n")
+        log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                       f"auto_pipeline live log start city={city}\n")
+        sys.stdout = _TeeStream(orig_stdout, log_file, lock)
+        sys.stderr = _TeeStream(orig_stderr, log_file, lock)
+        try:
+            yield log_path
+        finally:
+            print(f"[auto] live log saved to {log_path}", flush=True)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.stdout, sys.stderr = orig_stdout, orig_stderr
+
+
 import numpy as np
 from PIL import Image
 
@@ -109,11 +167,258 @@ STAGE_NAMES = {
     "H": "aggregate city",
 }
 
+
+
+def _tile_num(tile_name: str) -> int:
+    s = str(tile_name).strip()
+    if s.startswith("tile_"):
+        s = s.split("_", 1)[1]
+    return int(s)
+
+
+def parse_tile_range(spec: str | None) -> tuple[int, int] | None:
+    """Parse an inclusive tile range like ``0001:1000`` or ``1-1000``."""
+    if not spec:
+        return None
+    text = str(spec).strip()
+    sep = ":" if ":" in text else ("-" if "-" in text else None)
+    if sep is None:
+        n = _tile_num(text)
+        return (n, n)
+    a, b = text.split(sep, 1)
+    start, end = _tile_num(a), _tile_num(b)
+    if start > end:
+        start, end = end, start
+    return (start, end)
+
+
+def filter_tile_plans(plans: Sequence[TilePlan],
+                      tile_range: str | tuple[int, int] | None = None
+                      ) -> list[TilePlan]:
+    """Return only plans in the inclusive tile range, preserving order."""
+    if tile_range is None:
+        return list(plans)
+    bounds = (parse_tile_range(tile_range) if isinstance(tile_range, str)
+              else tile_range)
+    if bounds is None:
+        return list(plans)
+    start, end = bounds
+    return [p for p in plans if start <= _tile_num(p.name) <= end]
+
+
+def load_master_plan(path: str | Path) -> list[TilePlan]:
+    """Load a saved master tile plan JSON.
+
+    Accepts files written by :func:`save_master_plan` and also the
+    ``metadata/.pipeline_state.json`` shape used by completed runs.
+    """
+    p = Path(path)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    raw_tiles = data.get("tiles")
+    if isinstance(raw_tiles, dict):
+        rows = [v.get("plan", v) for _, v in sorted(raw_tiles.items())]
+    elif isinstance(raw_tiles, list):
+        rows = [v.get("plan", v) if isinstance(v, dict) else v
+                for v in raw_tiles]
+    else:
+        raise ValueError(f"master plan has no tiles: {p}")
+    out: list[TilePlan] = []
+    for rec in rows:
+        out.append(TilePlan(
+            name=str(rec["name"]),
+            row=int(rec["row"]),
+            col=int(rec["col"]),
+            lat=float(rec["lat"]),
+            lon=float(rec["lon"]),
+            bbox_wgs=tuple(float(x) for x in rec["bbox_wgs"]),
+        ))
+    return out
+
+
+def save_master_plan(city: str, area_bbox_wgs: tuple, plans: Sequence[TilePlan],
+                     out_path: str | Path, gsd: float = 0.5,
+                     size_px: int = 1024, overlap: float = 0.0) -> Path:
+    """Write a stable master tile plan JSON for later ranged generation."""
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plan_list = list(plans)
+    n_rows, n_cols = grid_shape(plan_list)
+    bbox_union = area_bbox_union(plan_list) if plan_list else None
+    data = {
+        "schema": "SynthUrbanSAT.master_tile_plan.v1",
+        "city": city,
+        "area_bbox_wgs": [float(x) for x in area_bbox_wgs],
+        "bbox_union_wgs": [float(x) for x in bbox_union] if bbox_union else None,
+        "gsd": float(gsd),
+        "size_px": int(size_px),
+        "tile_m": float(gsd) * int(size_px),
+        "overlap": float(overlap),
+        "n_rows": int(n_rows),
+        "n_cols": int(n_cols),
+        "n_tiles": int(len(plan_list)),
+        "tile_index_grid": grid_id_array(plan_list),
+        "tiles": [p.as_dict() for p in plan_list],
+    }
+    out.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    return out
+
 # Module-level handle to the running pipeline so per-tile worker
 # functions (which take only ``tr``) can access shared city-level
 # resources (union OSM, global mercator grid, city seg array) without
 # threading them through every signature.
 _ACTIVE_PIPELINE: "AutoPipeline | None" = None
+_CITY_ROAD_BUFFER_OVERRIDES: dict[str, dict[str, float]] = {}
+_CITY_ROAD_WIDTH_REPORTS: dict[str, dict] = {}
+
+
+def _default_road_buffer_m() -> dict[str, float]:
+    return dict(oa.CFG.get("osm", {}).get("road_buffer_m", {}))
+
+
+def _parse_osm_meters(value) -> float | None:
+    """Parse common OSM length strings into metres."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    text = text.replace(",", ".")
+    # Prefer a leading numeric value; OSM often stores "7.5", "7.5 m",
+    # "24 ft", or occasionally ranges/lists. Keep this intentionally simple.
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if not m:
+        return None
+    try:
+        val = float(m.group(0))
+    except ValueError:
+        return None
+    if val <= 0:
+        return None
+    if "ft" in text or "feet" in text or "foot" in text:
+        val *= 0.3048
+    return val
+
+
+def _parse_lanes(value) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", text)]
+    if not nums:
+        return None
+    # For odd tags like "2;3", use the maximum observed lane count.
+    lanes = max(nums)
+    if lanes <= 0 or lanes > 12:
+        return None
+    return lanes
+
+
+def _robust_median(values: list[float]) -> float | None:
+    vals = sorted(float(v) for v in values if v is not None and v > 0)
+    if not vals:
+        return None
+    n = len(vals)
+    mid = n // 2
+    return vals[mid] if n % 2 else 0.5 * (vals[mid - 1] + vals[mid])
+
+
+def _estimate_road_half_width_by_type(edges, default_half: dict[str, float],
+                                      *, min_samples: int = 3,
+                                      lane_width_m: float = 3.4,
+                                      margin_m: float = 1.2,
+                                      blend_weight: float = 0.65) -> tuple[dict[str, float], dict]:
+    """Estimate city-level highway buffer half-widths from OSM width/lanes.
+
+    This deliberately stays lightweight: no image segmentation. Per highway
+    type, explicit ``width=*`` wins; otherwise ``lanes`` gives a soft local
+    prior. Sparse/noisy estimates are blended with the global default table.
+    """
+    out = dict(default_half)
+    report = {
+        "mode": "local_lanes",
+        "lane_width_m": lane_width_m,
+        "lane_margin_m": margin_m,
+        "min_samples": min_samples,
+        "blend_weight": blend_weight,
+        "by_highway": {},
+    }
+    if edges is None or getattr(edges, "empty", True):
+        report["note"] = "no road edges; using default road_buffer_m"
+        return out, report
+    grouped: dict[str, list[float]] = {}
+    source_counts: dict[str, dict[str, int]] = {}
+    for _, row in edges.iterrows():
+        hw = row.get("highway")
+        if isinstance(hw, list):
+            hw = hw[0] if hw else None
+        if not hw or hw not in default_half:
+            continue
+        width_m = _parse_osm_meters(row.get("width"))
+        source = "width"
+        if width_m is None:
+            lanes = _parse_lanes(row.get("lanes"))
+            if lanes is None:
+                continue
+            width_m = lanes * lane_width_m + margin_m
+            source = "lanes"
+        # Clamp to plausible road full widths; this prevents odd tags from
+        # forcing 30m residential streets or 1m arterials.
+        default_full = 2.0 * float(default_half.get(hw, default_half.get("default", 4.0)))
+        lo = max(3.0, default_full * 0.55)
+        hi = min(36.0, default_full * 1.75)
+        width_m = max(lo, min(hi, float(width_m)))
+        grouped.setdefault(hw, []).append(width_m)
+        source_counts.setdefault(hw, {"width": 0, "lanes": 0})[source] += 1
+    for hw, widths in sorted(grouped.items()):
+        med_full = _robust_median(widths)
+        if med_full is None:
+            continue
+        default = float(default_half.get(hw, default_half.get("default", 4.0)))
+        est_half = 0.5 * med_full
+        n = len(widths)
+        if n >= min_samples:
+            # Blend with the global default so the city prior moves in the
+            # observed direction but stays stable for sparse OSM tags.
+            half = blend_weight * est_half + (1.0 - blend_weight) * default
+            source = "local_median_blend"
+        else:
+            half = 0.35 * est_half + 0.65 * default
+            source = "sparse_blend"
+        half = round(max(2.0, min(18.0, half)), 2)
+        out[hw] = half
+        report["by_highway"][hw] = {
+            "n": n,
+            "source": source,
+            "median_full_width_m": round(float(med_full), 2),
+            "default_half_width_m": round(default, 2),
+            "calibrated_half_width_m": half,
+            "tag_sources": source_counts.get(hw, {}),
+        }
+    if "default" in default_half:
+        # Use residential as the city default when available because many
+        # untyped/local roads visually resemble residential streets.
+        if "residential" in out:
+            out["default"] = round(float(out["residential"]), 2)
+        else:
+            out["default"] = float(default_half["default"])
+    report["road_buffer_m"] = out
+    return out, report
+
+
+def _rebuffer_road_edges_wgs(edges, bbox_wgs: tuple, road_buffer_m: dict[str, float]):
+    if edges is None or getattr(edges, "empty", True):
+        return None
+    try:
+        from dataprep.osm_tags import ROAD_HIGHWAY_KEEP
+        return oa.kr1._buffer_road_edges(
+            edges, tuple(bbox_wgs), road_buffer_m, set(ROAD_HIGHWAY_KEEP))
+    except Exception as e:  # noqa: BLE001
+        print(f"[C0] road rebuffer failed: {e}; keeping existing road geometry",
+              flush=True)
+        return None
 
 
 # --------------------------------------------------------------------- #
@@ -438,6 +743,165 @@ def _stage_b_one(tr: TileRun) -> TileRun:
     return tr
 
 
+
+def _iter_polygons(g):
+    if g is None or getattr(g, "is_empty", True):
+        return []
+    from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+    if isinstance(g, Polygon):
+        return [g]
+    if isinstance(g, MultiPolygon):
+        return list(g.geoms)
+    if isinstance(g, GeometryCollection):
+        out = []
+        for gg in g.geoms:
+            out.extend(_iter_polygons(gg))
+        return out
+    return []
+
+
+def _filter_water_geometry_sanity(cls_wgs: dict, bbox_wgs: tuple,
+                                  tile_size_px: int = 1024) -> dict:
+    """Drop OSM water polygons that look like forced-closed lines/coastline.
+
+    The thresholds are intentionally conservative: keep normal lakes/ponds and
+    riverbank polygons, reject huge tile-filling slivers, needle-like polygons,
+    and tiny fragments.
+    """
+    water = cls_wgs.get("water")
+    polys = _iter_polygons(water)
+    if not polys:
+        return cls_wgs
+    from shapely.ops import unary_union
+    from dataprep.raster_utils import class_geoms_to_local
+    tmp = {"water": water}
+    local, _ = class_geoms_to_local(tmp, bbox_wgs)
+    local_polys = _iter_polygons(local.get("water"))
+    kept = []
+    dropped = 0
+    tile_area_m2 = float(512.0 * 512.0)
+    # Keep WGS/local polygons paired by order where possible.
+    for i, (pw, pm) in enumerate(zip(polys, local_polys)):
+        area = float(pm.area)
+        if area < 25.0:
+            dropped += 1
+            continue
+        minx, miny, maxx, maxy = pm.bounds
+        width = max(1e-6, float(maxx - minx))
+        height = max(1e-6, float(maxy - miny))
+        bbox_area = width * height
+        fill = area / max(1e-6, bbox_area)
+        aspect = max(width / height, height / width)
+        tile_frac = area / tile_area_m2
+        # Forced-closed centre-lines often have extreme aspect and low fill.
+        if aspect > 25.0 and fill < 0.18:
+            dropped += 1
+            continue
+        # Coastline-like artifacts often fill most of a tile or create a giant
+        # clipped sheet. Keep true large water only if it is compact.
+        if tile_frac > 0.70 and (fill < 0.55 or aspect > 5.0):
+            dropped += 1
+            continue
+        kept.append(pw)
+    if len(kept) != len(polys):
+        print(f"[auto] water sanity filter: kept {len(kept)}/{len(polys)} polygons, dropped {dropped}", flush=True)
+    cls_wgs = dict(cls_wgs)
+    cls_wgs["water"] = unary_union(kept) if kept else None
+    return cls_wgs
+
+
+def _rgb_water_mask(rgb_path: str | Path, size: int) -> np.ndarray | None:
+    try:
+        if isinstance(rgb_path, Image.Image):
+            img = rgb_path.convert("RGB")
+        else:
+            img = Image.open(rgb_path).convert("RGB")
+        arr = np.asarray(img.resize((size, size), Image.Resampling.BILINEAR),
+                         dtype=np.float32) / 255.0
+    except Exception as e:  # noqa: BLE001
+        print(f"[auto] water RGB filter: failed to read RGB: {e}", flush=True)
+        return None
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    mx = np.maximum.reduce([r, g, b])
+    mn = np.minimum.reduce([r, g, b])
+    sat = mx - mn
+    brightness = (r + g + b) / 3.0
+    blue_dom = b - np.maximum(r, g)
+    green_dom = g - np.maximum(r, b)
+    # Water in Esri tiles is often blue/cyan or very dark smooth water. Avoid
+    # bright vegetation by suppressing strong green dominance.
+    blue_water = (blue_dom > 0.035) & (b > 0.18) & (green_dom < 0.12)
+    dark_water = (brightness < 0.22) & (sat < 0.18) & (green_dom < 0.08)
+    cyan_water = (b > 0.28) & (g > 0.24) & (r < 0.22) & (green_dom < 0.18)
+    return blue_water | dark_water | cyan_water
+
+
+def _filter_water_geometry_with_rgb(cls_wgs: dict, tr: TileRun) -> dict:
+    water = cls_wgs.get("water")
+    if water is None or getattr(water, "is_empty", True):
+        return cls_wgs
+    import math
+    from rasterio.features import rasterize as _rasterize, shapes as _shapes
+    from rasterio.transform import from_bounds
+    from shapely.geometry import shape as _shape
+    from shapely.ops import unary_union, transform as _transform
+    from dataprep.geometry_utils import make_transformer, reproject_geom
+
+    size = int(tr.state.get("size") or 1024)
+    rgb_mask = _rgb_water_mask(tr.state.get("sat_rgb"), size)
+    if rgb_mask is None:
+        return cls_wgs
+    bbox = tuple(float(x) for x in tr.state["bbox_wgs"])
+    W_lon, S_lat, E_lon, N_lat = bbox
+    R = 6378137.0
+    W_m = R * math.radians(W_lon)
+    E_m = R * math.radians(E_lon)
+    N_m = R * math.log(math.tan(math.pi / 4 + math.radians(N_lat) / 2))
+    S_m = R * math.log(math.tan(math.pi / 4 + math.radians(S_lat) / 2))
+    transform = from_bounds(W_m, S_m, E_m, N_m, size, size)
+    fwd = make_transformer("EPSG:4326", "EPSG:3857")
+    inv = make_transformer("EPSG:3857", "EPSG:4326")
+    water_merc = reproject_geom(water, fwd)
+    if water_merc is None or water_merc.is_empty:
+        return cls_wgs
+    osm_mask = _rasterize([(water_merc, 1)], out_shape=(size, size),
+                          transform=transform, fill=0, default_value=1,
+                          dtype="uint8", all_touched=False) > 0
+    if int(osm_mask.sum()) == 0:
+        return cls_wgs
+    refined = osm_mask & rgb_mask
+    # If the RGB heuristic is too strict for a tile, fall back to geometry-only
+    # rather than deleting all water.
+    keep_ratio = float(refined.sum()) / max(1.0, float(osm_mask.sum()))
+    if keep_ratio < 0.08:
+        print(f"[auto] water RGB filter: weak RGB support ({keep_ratio:.3f}); keeping geometry-filtered water", flush=True)
+        return cls_wgs
+    geoms = []
+    for geom, val in _shapes(refined.astype("uint8"), mask=refined,
+                             transform=transform):
+        if not val:
+            continue
+        gm = _shape(geom)
+        if not gm.is_empty and gm.area >= 25.0:
+            geoms.append(_transform(inv.transform, gm))
+    cls_wgs = dict(cls_wgs)
+    cls_wgs["water"] = unary_union(geoms) if geoms else None
+    print(f"[auto] water RGB filter: kept {len(geoms)} pieces, support={keep_ratio:.3f}", flush=True)
+    return cls_wgs
+
+
+def _apply_water_fix_mode(cls_wgs: dict, tr: TileRun, mode: str) -> dict:
+    mode = (mode or "geometry_filter").strip().lower()
+    if mode in {"off", "none"}:
+        return cls_wgs
+    if mode in {"geometry_filter", "imagery_filter"}:
+        cls_wgs = _filter_water_geometry_sanity(
+            cls_wgs, tuple(tr.state["bbox_wgs"]), int(tr.state.get("size") or 1024))
+    if mode == "imagery_filter":
+        cls_wgs = _filter_water_geometry_with_rgb(cls_wgs, tr)
+    return cls_wgs
+
+
 def _stage_c_one(tr: TileRun) -> TileRun:
     """Stage C: OSM 6-class extract + rasterize. Updates tr.state with
     seg_osm + cls_wgs + ratios (so KR2 doesn't re-fetch in stage E).
@@ -465,6 +929,28 @@ def _stage_c_one(tr: TileRun) -> TileRun:
                     return True
             return False
 
+        def _allow_empty_tile() -> bool:
+            return bool(
+                getattr(pipe.cfg, "allow_non_foliage", True)
+            ) if pipe is not None and hasattr(pipe, "cfg") else True
+
+        def _fetch_classes_or_empty_ground(reason: str) -> dict:
+            try:
+                return oa.fetch_classes_wgs(bbox)
+            except Exception as exc:  # noqa: BLE001
+                msg = f"{type(exc).__name__}: {exc}"
+                msg_l = msg.lower()
+                empty_like = any(tok in msg_l for tok in (
+                    "no usable", "no building", "no features",
+                    "ground-only", "0 elements",
+                ))
+                if _allow_empty_tile() and empty_like:
+                    print(f"[auto] {tr.plan.name} {reason} returned no "
+                          f"explicit OSM features ({msg}); using "
+                          "ground-only fallback", flush=True)
+                    return {}
+                raise
+
         cls_wgs = {}
         pipe = _ACTIVE_PIPELINE
         if pipe is not None and hasattr(pipe, "cfg"):
@@ -484,14 +970,33 @@ def _stage_c_one(tr: TileRun) -> TileRun:
                 print(f"[auto] {tr.plan.name} city OSM clip has no usable "
                       "features; falling back to per-tile Overpass",
                       flush=True)
-                cls_wgs = oa.fetch_classes_wgs(bbox)
+                cls_wgs = _fetch_classes_or_empty_ground("per-tile fallback")
         elif not cls_wgs:
             # Fallback: per-tile Overpass fetch (legacy behaviour)
-            cls_wgs = oa.fetch_classes_wgs(bbox)
+            cls_wgs = _fetch_classes_or_empty_ground("legacy per-tile fetch")
+        water_mode = getattr(pipe.cfg, "water_fix_mode", "geometry_filter") if pipe is not None else "geometry_filter"
+        cls_wgs = _apply_water_fix_mode(cls_wgs, tr, water_mode)
         if not _has_non_ground_feature(cls_wgs):
-            raise RuntimeError("OSM fetch returned no building/water/grass/"
-                               "foliage/road features; refusing to generate "
-                               "ground-only semantic output")
+            allow_empty = bool(
+                getattr(pipe.cfg, "allow_non_foliage", True)
+            ) if pipe is not None and hasattr(pipe, "cfg") else True
+            if not allow_empty:
+                raise RuntimeError(
+                    "OSM fetch returned no building/water/grass/foliage/"
+                    "road features; refusing to generate ground-only "
+                    "semantic output"
+                )
+            from shapely.geometry import box as _box
+            cls_wgs = {
+                "building": None,
+                "water": None,
+                "grass": None,
+                "foliage": None,
+                "road": None,
+                "ground": _box(*bbox),
+            }
+            print(f"[auto] {tr.plan.name} has no explicit OSM features; "
+                  "generating ground-only semantic tile", flush=True)
         cls_utm, _ = class_geoms_to_local(cls_wgs, bbox)
         seg = rasterize_seg(cls_utm, tr.state["cx_utm"], tr.state["cy_utm"],
                             tr.state["gsd"], tr.state["size"])
@@ -656,6 +1161,9 @@ def _city_config_path(city: str) -> Path:
     cfg["paths"]["tile_root"] = f"output/{city}"
     cfg["paths"]["geojson_dir"] = f"output/{city}/_geojson"
     cfg["paths"]["fig_dir"] = f"output/{city}/_fig"
+    road_buf = _CITY_ROAD_BUFFER_OVERRIDES.get(city)
+    if road_buf:
+        cfg.setdefault("osm", {})["road_buffer_m"] = road_buf
     out = ensure_dir(ROOT / "configs") / f"_city_{city}.yaml"
     out.write_text(_yaml.safe_dump(cfg, sort_keys=False, allow_unicode=True),
                    encoding="utf-8")
@@ -668,7 +1176,7 @@ def _call_kr3(city: str, tile_name: str, scatter_seed: int,
                tree_h_dist: str = "lognormal",
                tree_h_seed: int = 11,
                tree_h_min: float = 6.0,
-               tree_h_max: float = 20.0,
+               tree_h_max: float = 10.0,
                canopy_npz: str | None = None,
                cluster_size_min: int = 10,
                cluster_size_max: int = 20,
@@ -685,8 +1193,8 @@ def _call_kr3(city: str, tile_name: str, scatter_seed: int,
                enable_street_trees: bool = False,
                procedural_augment_ratio: float = 0.0,
                canopy_prob_scale: float = 1.0,
-               topdown_tree_xy_scale: float = 1.0,
-               gn_tree_amount: float = 0.5,
+               topdown_tree_xy_scale: float = 1.8,
+               gn_tree_amount: float = 0.25,
                gn_safe_building: float = 2.5,
                gn_safe_road: float = 3.0,
                gn_safe_water: float = 2.0,
@@ -694,14 +1202,14 @@ def _call_kr3(city: str, tile_name: str, scatter_seed: int,
                gn_min_distance: float = 3.5,
                gn_xy_stretch: float = 0.75,
                gn_z_stretch: float = 0.5,
-               gn_xy_stretch_min_at_0: float = 0.60,
-               gn_xy_stretch_min_at_1: float = 0.90,
-               gn_xy_stretch_max_at_0: float = 0.90,
-               gn_xy_stretch_max_at_1: float = 4.00,
-               gn_z_stretch_min_at_0: float = 0.45,
-               gn_z_stretch_min_at_1: float = 1.15,
-               gn_z_stretch_max_at_0: float = 0.80,
-               gn_z_stretch_max_at_1: float = 2.40,
+               gn_xy_stretch_min_at_0: float = 3.00,
+               gn_xy_stretch_min_at_1: float = 3.00,
+               gn_xy_stretch_max_at_0: float = 5.00,
+               gn_xy_stretch_max_at_1: float = 5.00,
+               gn_z_stretch_min_at_0: float = 0.25,
+               gn_z_stretch_min_at_1: float = 0.25,
+               gn_z_stretch_max_at_0: float = 0.55,
+               gn_z_stretch_max_at_1: float = 0.55,
                uniform_tree_scale: bool = False,
                render_depth: bool = True):
     """Same shape as ``osm_app._run_kr3`` but uses the city-patched yaml.
@@ -841,8 +1349,8 @@ def _stage_f_one(tr: TileRun, scatter_seed: int, tree_density: float,
                   procedural_augment_ratio: float = 0.0,
                   canopy_prob_scale: float = 1.0,
                   uniform_tree_scale: bool = False,
-                  topdown_tree_xy_scale: float = 1.0,
-                  gn_tree_amount: float = 0.5,
+                  topdown_tree_xy_scale: float = 1.8,
+                  gn_tree_amount: float = 0.25,
                   gn_safe_building: float = 2.5,
                   gn_safe_road: float = 3.0,
                   gn_safe_water: float = 2.0,
@@ -850,14 +1358,14 @@ def _stage_f_one(tr: TileRun, scatter_seed: int, tree_density: float,
                   gn_min_distance: float = 3.5,
                   gn_xy_stretch: float = 0.75,
                   gn_z_stretch: float = 0.5,
-                  gn_xy_stretch_min_at_0: float = 0.60,
-                  gn_xy_stretch_min_at_1: float = 0.90,
-                  gn_xy_stretch_max_at_0: float = 0.90,
-                  gn_xy_stretch_max_at_1: float = 4.00,
-                  gn_z_stretch_min_at_0: float = 0.45,
-                  gn_z_stretch_min_at_1: float = 1.15,
-                  gn_z_stretch_max_at_0: float = 0.80,
-                  gn_z_stretch_max_at_1: float = 2.40) -> TileRun:
+                  gn_xy_stretch_min_at_0: float = 3.00,
+                  gn_xy_stretch_min_at_1: float = 3.00,
+                  gn_xy_stretch_max_at_0: float = 5.00,
+                  gn_xy_stretch_max_at_1: float = 5.00,
+                  gn_z_stretch_min_at_0: float = 0.25,
+                  gn_z_stretch_min_at_1: float = 0.25,
+                  gn_z_stretch_max_at_0: float = 0.55,
+                  gn_z_stretch_max_at_1: float = 0.55) -> TileRun:
     """Stage F: KR3 Blender assemble (serial)."""
     t0 = time.time()
     try:
@@ -928,22 +1436,23 @@ def _stage_f_one(tr: TileRun, scatter_seed: int, tree_density: float,
             use_blender_seg = getattr(pipe.cfg, "use_blender_seg", False)
 
         if use_blender_seg:
-            print(f"[auto] {tr.plan.name} keeping direct Blender-rendered topview for 1-to-1 depth alignment.")
-        else:
-            tree_mask_png = tile_dir / "topview_tree_mask.png"
-            try:
-                if (tile_dir / "topview_treeseg.png").exists():
-                    _write_blender_tree_mask_mercator(
-                        tr, tile_dir / "topview_treeseg.png", tree_mask_png)
-            except Exception as e:  # noqa: BLE001
-                print(f"[auto] {tr.plan.name} Blender tree-mask extraction failed: {e}")
-            # Compose topview_treeseg.png directly in Web Mercator grid to keep the
-            # render flat (平铺) and bypass lossy / crooked UTM warping rotation/slanted edges.
-            try:
-                _compose_topview_treeseg_mercator(
-                    tr, tile_dir / "topview_treeseg.png")
-            except Exception as e:  # noqa: BLE001
-                print(f"[auto] {tr.plan.name} topview compose failed: {e}")
+            print(f"[auto] {tr.plan.name} use_blender_seg requested; using "
+                  "Blender only for tree-crown mask, then writing a "
+                  "categorical 6-class Mercator seg map.")
+        tree_mask_png = tile_dir / "topview_tree_mask.png"
+        try:
+            if (tile_dir / "topview_treeseg.png").exists():
+                _write_blender_tree_mask_mercator(
+                    tr, tile_dir / "topview_treeseg.png", tree_mask_png)
+        except Exception as e:  # noqa: BLE001
+            print(f"[auto] {tr.plan.name} Blender tree-mask extraction failed: {e}")
+        # Compose topview_treeseg.png directly in Web Mercator grid to keep the
+        # render flat and avoid using anti-aliased Blender RGB as class labels.
+        try:
+            _compose_topview_treeseg_mercator(
+                tr, tile_dir / "topview_treeseg.png")
+        except Exception as e:  # noqa: BLE001
+            print(f"[auto] {tr.plan.name} topview compose failed: {e}")
         
         # Overwrite seg_6class.png with the composed topview_treeseg.png to ensure
         # pixel-alignment and tree-crown coherence matching physical reality. Only fallback
@@ -986,8 +1495,6 @@ def _stage_f_one(tr: TileRun, scatter_seed: int, tree_density: float,
 
             # Apply coordinate warping to output images to remove any UTM rotation angle ("歪了")
             mapped_files = ["5_depth.png", "5_depth.exr"]
-            if use_blender_seg:
-                mapped_files.insert(0, "4_seg.png")
             for mapped_file in mapped_files:
                 p = tile_dir / mapped_file
                 if p.exists():
@@ -1045,9 +1552,7 @@ def _stage_f_one(tr: TileRun, scatter_seed: int, tree_density: float,
                 "topview_tree_mask.png",
                 "topview_treeseg.png",
                 "3_seg.png",
-                "4_depth.png",
-                "kr3_stdout.log",
-                "kr3_stderr.log"
+                "4_depth.png"
             ]
             for f_name in redundant_files:
                 path_to_del = tile_dir / f_name
@@ -1089,7 +1594,7 @@ class AutoPipelineConfig:
     tree_h_dist: str = "lognormal"
     tree_h_seed: int = 11
     tree_h_min: float = 6.0
-    tree_h_max: float = 20.0
+    tree_h_max: float = 10.0
     # Real-world cluster grouping for canopy_driven scatter mode.
     # Each cluster places `U(cluster_size_min, cluster_size_max)` trees in
     # an ellipse of radius `U(cluster_disk_radius_min, ..._max)` metres
@@ -1125,9 +1630,8 @@ class AutoPipelineConfig:
     # Poisson disk; ``canopy_prob_streets`` is canopy_prob + B3 street
     # trees along road centrelines.
     scatter_mode: str = "canopy_prob"
-    # B2 (soft constraint): allow trees to spawn outside OSM ``foliage``
-    # at a reduced density (on grass / ground), excluding building /
-    # road / water surfaces.
+    # Allow GN scatter to use open land as a candidate substrate by default, but
+    # keep it sparse with low tree amount and larger Poisson spacing.
     allow_non_foliage: bool = True
     # B3: also place equally-spaced trees along OSM road buffers.
     enable_street_trees: bool = False
@@ -1138,10 +1642,9 @@ class AutoPipelineConfig:
     # Multiplier applied to per-cell canopy probability in B1.
     canopy_prob_scale: float = 1.0
     # Crown horizontal scaling factor for 2D/3D trees
-    topdown_tree_xy_scale: float = 1.0
-    # Geometry Nodes tree scatter controls. 0.5 is the tuned default;
-    # internally mapped to density scale 1.0 via 0.1 + 1.9 * amount.
-    gn_tree_amount: float = 0.5
+    topdown_tree_xy_scale: float = 1.8
+    # Geometry Nodes tree scatter controls. Higher values increase trees per clump.
+    gn_tree_amount: float = 0.25
     gn_safe_building: float = 2.5
     gn_safe_road: float = 3.0
     gn_safe_water: float = 2.0
@@ -1149,19 +1652,33 @@ class AutoPipelineConfig:
     gn_min_distance: float = 3.5
     gn_xy_stretch: float = 0.75
     gn_z_stretch: float = 0.5
-    gn_xy_stretch_min_at_0: float = 1.00
-    gn_xy_stretch_min_at_1: float = 0.90
-    gn_xy_stretch_max_at_0: float = 1.00
-    gn_xy_stretch_max_at_1: float = 4.00
-    gn_z_stretch_min_at_0: float = 1.00
-    gn_z_stretch_min_at_1: float = 1.15
-    gn_z_stretch_max_at_0: float = 1.00
-    gn_z_stretch_max_at_1: float = 2.40
+    gn_xy_stretch_min_at_0: float = 3.00
+    gn_xy_stretch_min_at_1: float = 3.00
+    gn_xy_stretch_max_at_0: float = 5.00
+    gn_xy_stretch_max_at_1: float = 5.00
+    gn_z_stretch_min_at_0: float = 0.25
+    gn_z_stretch_min_at_1: float = 0.25
+    gn_z_stretch_max_at_0: float = 0.55
+    gn_z_stretch_max_at_1: float = 0.55
     # Use direct Blender-rendered topview for segmentation to guarantee 1-to-1 depth alignment
-    use_blender_seg: bool = False
+    use_blender_seg: bool = True
+    # Reclassify a stable random portion of open bare ground (class 5) ->
+    # grass (class 4). Keep some black ground so OSM voids do not become
+    # unrealistically all-vegetated.
+    open_ground_to_grass: bool = True
+    open_ground_to_grass_min: float = 0.80
+    open_ground_to_grass_max: float = 0.80
     # Canopy
     canopy_source: str = "eth_10m"
     target_foliage_ratio: float | None = 0.25
+    water_fix_mode: str = "geometry_filter"
+    # Road width: derive one city-level buffer table from OSM width/lanes tags.
+    # This is lightweight and reproducible: no satellite/SAM road extraction.
+    road_width_mode: str = "local_lanes"  # off|default|local_lanes
+    road_width_min_samples: int = 3
+    road_lane_width_m: float = 3.4
+    road_lane_margin_m: float = 1.2
+    road_width_blend_weight: float = 0.65
     # Stage toggles
     # Concurrency
     io_workers: int = 8
@@ -1170,6 +1687,12 @@ class AutoPipelineConfig:
     # Filenames are fixed; tile gsd/size are pinned at 0.5 / 1024 px
     gsd: float = 0.5
     size_px: int = 1024
+    # Optional fixed master plan. When set, generation uses these exact
+    # tile bboxes instead of replanning from ``area_bbox_wgs``.
+    tile_plans: list[TilePlan] | None = None
+    tile_range: tuple[int, int] | None = None
+    live_log_path: str | None = None
+    progress_latest_path: str | None = None
 
 
 class AutoPipeline:
@@ -1182,10 +1705,22 @@ class AutoPipeline:
         self.cfg = cfg
         self.city_dir = ROOT / "output" / cfg.city
         ensure_dir(self.city_dir / "metadata")
+        self.config_dir = ensure_dir(self.city_dir / "config")
+        self.config_latest_path = self.config_dir / "run_config_latest.json"
         self.state_path = self.city_dir / "metadata" / ".pipeline_state.json"
         self.failures_log = self.city_dir / "metadata" / "_failures.log"
         self.failures_json = self.city_dir / "metadata" / "_failures.json"
         self.timing_latest_path = self.city_dir / "metadata" / "run_timing_latest.json"
+        self.live_log_path = (Path(cfg.live_log_path) if cfg.live_log_path
+                              else self.city_dir / "metadata" / "run_live.log")
+        self.progress_latest_path = (Path(cfg.progress_latest_path)
+                                     if cfg.progress_latest_path else
+                                     self.city_dir / "metadata" / "run_progress_latest.json")
+        self._run_started_at: str | None = None
+        self._current_stage: str | None = None
+        self._current_event: str = "initializing"
+        self._last_progress_tile: str | None = None
+        self._last_progress_status: str | None = None
         self.runs: list[TileRun] = []
         self.progress_cb = progress_cb or (lambda *a: None)
         # ---- City-level shared resources (populated by stage C0) ----
@@ -1195,13 +1730,19 @@ class AutoPipeline:
         self.city_cls_wgs: dict = {}
         self.city_grid_info = None  # CityGridInfo | None
         self.city_seg = None        # np.ndarray | None  (uint8 H×W)
+        self.road_buffer_m: dict[str, float] | None = None
+        self.road_width_report: dict | None = None
 
     # ---------- planning + state IO ---------- #
     def plan(self, force_clean: bool = False) -> list[TileRun]:
-        plans = plan_tiles(self.cfg.area_bbox_wgs,
-                           gsd=self.cfg.gsd,
-                           size_px=self.cfg.size_px,
-                           overlap=self.cfg.overlap)
+        if self.cfg.tile_plans is not None:
+            plans = list(self.cfg.tile_plans)
+        else:
+            plans = plan_tiles(self.cfg.area_bbox_wgs,
+                               gsd=self.cfg.gsd,
+                               size_px=self.cfg.size_px,
+                               overlap=self.cfg.overlap)
+        plans = filter_tile_plans(plans, self.cfg.tile_range)
         self.runs = [TileRun(plan=p) for p in plans]
         ensure_dir(self.city_dir)
         # Resume from disk (state + existing artifacts).
@@ -1271,6 +1812,98 @@ class AutoPipeline:
             json.dumps({"failures": failed}, ensure_ascii=False, indent=2),
             encoding="utf-8")
 
+    def _stage_progress_counts(self) -> dict:
+        out = {}
+        for s in STAGES:
+            counts = {"ok": 0, "failed": 0, "blocked": 0,
+                      "pending": 0, "other": 0}
+            for tr in self.runs:
+                status = tr.status.get(s, "pending")
+                if status in counts:
+                    counts[status] += 1
+                else:
+                    counts["other"] += 1
+            out[s] = counts
+        return out
+
+    def _save_progress_snapshot(self, event: str, stage: str | None = None,
+                                tile: str | None = None,
+                                status: str | None = None) -> None:
+        ensure_dir(self.city_dir / "metadata")
+        stage = stage or self._current_stage
+        self._current_event = event
+        if stage is not None:
+            self._current_stage = stage
+        if tile is not None:
+            self._last_progress_tile = tile
+        if status is not None:
+            self._last_progress_status = status
+        payload = {
+            "city": self.cfg.city,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "started_at": self._run_started_at,
+            "event": event,
+            "current_stage": self._current_stage,
+            "current_stage_name": (STAGE_NAMES.get(self._current_stage)
+                                   if self._current_stage else None),
+            "last_tile": self._last_progress_tile,
+            "last_status": self._last_progress_status,
+            "n_tiles": len(self.runs),
+            "stage_counts": self._stage_progress_counts(),
+            "live_log_path": str(self.live_log_path),
+            "timing_path": str(self.timing_latest_path),
+        }
+        tmp = self.progress_latest_path.with_suffix(
+            self.progress_latest_path.suffix + ".tmp")
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, self.progress_latest_path)
+
+    def _log_stage_boundary(self, stage: str, event: str) -> None:
+        counts = self._stage_progress_counts().get(stage, {})
+        print(f"[auto] {event} stage {stage} ({STAGE_NAMES[stage]}) "
+              f"ok={counts.get('ok', 0)}/{len(self.runs)} "
+              f"failed={counts.get('failed', 0)} "
+              f"blocked={counts.get('blocked', 0)} "
+              f"pending={counts.get('pending', 0)}", flush=True)
+        self._save_progress_snapshot(event, stage=stage)
+
+    def _save_run_config(self, status: str = "started",
+                         started_at: str | None = None,
+                         ended_at: str | None = None,
+                         duration_sec: float | None = None,
+                         summary: dict | None = None,
+                         error: str | None = None) -> Path:
+        """Persist the exact run configuration under output/<city>/config/."""
+        ensure_dir(self.config_dir)
+        payload = {
+            "schema": "SynthUrbanSAT.osm_pipeline.run_config.v1",
+            "city": self.cfg.city,
+            "status": status,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "started_at": started_at,
+            "ended_at": ended_at,
+            "duration_sec": (round(float(duration_sec), 3)
+                             if duration_sec is not None else None),
+            "duration_min": (round(float(duration_sec) / 60.0, 3)
+                             if duration_sec is not None else None),
+            "n_tiles": len(self.runs),
+            "tile_names": [tr.plan.name for tr in self.runs],
+            "argv": list(sys.argv),
+            "summary": summary or {},
+            "error": error,
+            "config": asdict(self.cfg),
+            "road_width_calibration": self.road_width_report or {},
+        }
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        status_clean = (re.sub(r"[^A-Za-z0-9_.-]+", "_",
+                               str(status)).strip("_") or "run")
+        history_path = self.config_dir / f"run_config_{stamp}_{status_clean}.json"
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        self.config_latest_path.write_text(text, encoding="utf-8")
+        history_path.write_text(text, encoding="utf-8")
+        return self.config_latest_path
+
     def _save_run_timing(self, started_at: str, ended_at: str,
                          duration_sec: float, summary: dict,
                          error: str | None = None) -> None:
@@ -1310,9 +1943,17 @@ class AutoPipeline:
         text = json.dumps(payload, ensure_ascii=False, indent=2)
         self.timing_latest_path.write_text(text, encoding="utf-8")
         history_path.write_text(text, encoding="utf-8")
+        config_path = self._save_run_config(
+            status="failed" if error else "ok",
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_sec=duration_sec,
+            summary=summary,
+            error=error)
         summary["duration_sec"] = payload["duration_sec"]
         summary["duration_min"] = payload["duration_min"]
         summary["timing_path"] = str(self.timing_latest_path)
+        summary["config_path"] = str(config_path)
 
     # ---------- run helpers ---------- #
     def _need(self, tr: TileRun, stage: str) -> bool:
@@ -1321,7 +1962,10 @@ class AutoPipeline:
         return tr.status.get(stage) != "ok"
 
     def _emit(self, stage: str, tr: TileRun) -> None:
-        self.progress_cb(stage, tr.plan.name, tr.status.get(stage, "?"))
+        status = tr.status.get(stage, "?")
+        self.progress_cb(stage, tr.plan.name, status)
+        self._save_progress_snapshot("tile_done", stage=stage,
+                                     tile=tr.plan.name, status=status)
 
     def _run_stage_c0(self) -> None:
         """Pre-stage C: city-level union OSM fetch + global mercator grid.
@@ -1460,15 +2104,64 @@ class AutoPipeline:
                 print(f"[C0] city_seg rasterize failed: {e}", flush=True)
                 self.city_seg = None
 
+    def _calibrate_city_road_widths(self) -> None:
+        mode = str(getattr(self.cfg, "road_width_mode", "local_lanes") or "default").lower()
+        default_half = _default_road_buffer_m()
+        if mode in {"off", "none", "default", "fixed"}:
+            self.road_buffer_m = default_half
+            self.road_width_report = {
+                "mode": mode,
+                "note": "using default road_buffer_m",
+                "road_buffer_m": default_half,
+            }
+        else:
+            edges = None
+            if isinstance(self.city_cls_wgs, dict):
+                edges = self.city_cls_wgs.get("_road_edges")
+            self.road_buffer_m, self.road_width_report = _estimate_road_half_width_by_type(
+                edges, default_half,
+                min_samples=int(self.cfg.road_width_min_samples),
+                lane_width_m=float(self.cfg.road_lane_width_m),
+                margin_m=float(self.cfg.road_lane_margin_m),
+                blend_weight=float(self.cfg.road_width_blend_weight),
+            )
+        road_buffer = dict(self.road_buffer_m or default_half)
+        oa.CFG.setdefault("osm", {})["road_buffer_m"] = road_buffer
+        _CITY_ROAD_BUFFER_OVERRIDES[self.cfg.city] = road_buffer
+        _CITY_ROAD_WIDTH_REPORTS[self.cfg.city] = dict(self.road_width_report or {})
+        if isinstance(self.city_cls_wgs, dict):
+            edges = self.city_cls_wgs.get("_road_edges")
+            if edges is not None and not getattr(edges, "empty", True):
+                ubox = area_bbox_union([tr.plan for tr in self.runs])
+                road_geom = _rebuffer_road_edges_wgs(edges, tuple(ubox), road_buffer) if ubox else None
+                if road_geom is not None and not getattr(road_geom, "is_empty", True):
+                    self.city_cls_wgs["road"] = road_geom
+                    print("[C0] rebuilt city road geometry with calibrated widths",
+                          flush=True)
+        ensure_dir(self.config_dir)
+        road_path = self.config_dir / "road_width_calibration_latest.json"
+        road_path.write_text(json.dumps(self.road_width_report or {}, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+        changed = []
+        for hw, half in sorted((self.road_buffer_m or {}).items()):
+            old = float(default_half.get(hw, half))
+            if abs(float(half) - old) >= 0.05:
+                changed.append(f"{hw}:{old:.1f}->{float(half):.1f}")
+        preview = ", ".join(changed[:10]) if changed else "no changes"
+        print(f"[C0] road width calibration mode={mode}; {preview}", flush=True)
+
     # ---------- main run ---------- #
     def run(self) -> dict:
         """Execute all stages. Returns final summary dict."""
         run_t0 = time.time()
         started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._run_started_at = started_at
+        self._save_progress_snapshot("run_started")
         summary: dict | None = None
         run_error: str | None = None
         if not self.runs:
             self.plan()
+        self._save_run_config(status="started", started_at=started_at)
         if not self.runs:
             summary = {"status": "empty", "n_tiles": 0}
             ended_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1487,20 +2180,30 @@ class AutoPipeline:
                 global _ACTIVE_PIPELINE
                 _ACTIVE_PIPELINE = self
                 # ---- Stage B: imagery (parallel IO) ---- #
+                self._log_stage_boundary("B", "stage_start")
                 self._run_pool("B", _stage_b_one,
                                workers=self.cfg.io_workers)
                 self._save_state()
+                self._log_stage_boundary("B", "stage_done")
 
                 # ---- Stage C0: city-level union OSM + global grid ---- #
+                self._save_progress_snapshot("stage_c0_start", stage="C")
                 self._run_stage_c0()
+                self._calibrate_city_road_widths()
+                self._save_run_config(status="road_width_calibrated",
+                                      started_at=started_at)
+                self._save_progress_snapshot("stage_c0_done", stage="C")
 
                 # ---- Stage C: OSM (parallel IO, smaller pool) ---- #
+                self._log_stage_boundary("C", "stage_start")
                 self._run_pool("C", _stage_c_one,
                                workers=self.cfg.osm_workers,
                                require=("B",))
                 self._save_state()
+                self._log_stage_boundary("C", "stage_done")
 
                 # ---- Stage D: canopy ---- #
+                self._log_stage_boundary("D", "stage_start")
                 self._run_pool(
                     "D",
                     lambda tr: _stage_d_one(tr,
@@ -1509,8 +2212,10 @@ class AutoPipeline:
                     workers=self.cfg.canopy_workers,
                     require=("B", "C"))
                 self._save_state()
+                self._log_stage_boundary("D", "stage_done")
 
                 # ---- Stage E: KR2 (serial; KR2 mutates global state) ---- #
+                self._log_stage_boundary("E", "stage_start")
                 for tr in self.runs:
                     if not self._need(tr, "E"):
                         self._emit("E", tr); continue
@@ -1524,8 +2229,10 @@ class AutoPipeline:
                         self._log_failure(tr, "E")
                     self._emit("E", tr)
                 self._save_state()
+                self._log_stage_boundary("E", "stage_done")
 
                 # ---- Stage F: KR3 Blender (serial) ---- #
+                self._log_stage_boundary("F", "stage_start")
                 for tr in self.runs:
                     if not self._need(tr, "F"):
                         self._emit("F", tr); continue
@@ -1575,8 +2282,10 @@ class AutoPipeline:
                         self._log_failure(tr, "F")
                     self._emit("F", tr)
                 self._save_state()
+                self._log_stage_boundary("F", "stage_done")
 
                 # ---- Stage H: aggregate ---- #
+                self._log_stage_boundary("H", "stage_start")
                 try:
                     aggregate_city(self.cfg.city, self.runs)
                 except Exception as e:  # noqa: BLE001
@@ -1585,8 +2294,10 @@ class AutoPipeline:
                                 f"AGGREGATE failed: {e}\n")
                 self._save_state()
                 self._save_failures_json()
+                self._log_stage_boundary("H", "stage_done")
 
             summary = self.summary()
+            self._save_progress_snapshot("run_done")
             return summary
         except Exception as e:
             run_error = f"{type(e).__name__}: {e}"
@@ -2184,6 +2895,8 @@ def _compose_topview_treeseg_mercator(tr: TileRun, out_png: Path) -> None:
     seg = np.full((size, size), ground_id, dtype=np.uint8)
     hard_surface_mask = np.zeros((size, size), dtype=bool)
     building_mask = np.zeros((size, size), dtype=bool)
+    water_mask = np.zeros((size, size), dtype=bool)
+    road_mask = np.zeros((size, size), dtype=bool)
     order = sorted(CLASS_IDS.keys(), key=lambda k: CLASS_PRIORITY[k])
     for name in order:
         g_wgs = cls_wgs.get(name)
@@ -2208,6 +2921,10 @@ def _compose_topview_treeseg_mercator(tr: TileRun, out_png: Path) -> None:
             hard_surface_mask |= hit
         if name == "building":
             building_mask |= hit
+        if name == "water":
+            water_mask |= hit
+        if name == "road":
+            road_mask |= hit
 
     # Foliage/canopy polygons are the substrate used to decide where trees can
     # grow. Keep that area visually grouped with grass; only actual tree
@@ -2246,6 +2963,102 @@ def _compose_topview_treeseg_mercator(tr: TileRun, out_png: Path) -> None:
                 n_canopy_polys = len(shapes)
         except Exception as e:  # noqa: BLE001
             print(f"[auto] {tr.plan.name} canopy substrate grass paint failed: {e}")
+
+    # ---- 1c. Open bare ground -> grass ---- #
+    # OSM leaves a lot of land as implicit "ground". Convert a target
+    # fraction into grass using a continuous, RGB-guided score rather than
+    # independent per-pixel randomness: real greenish pixels are preferred,
+    # and a smoothed noise field keeps the remaining ground in coherent blobs.
+    pipe = _ACTIVE_PIPELINE
+    open_ground_to_grass = True
+    grass_min = 0.80
+    grass_max = 0.80
+    if pipe is not None and hasattr(pipe, "cfg"):
+        open_ground_to_grass = bool(
+            getattr(pipe.cfg, "open_ground_to_grass", True))
+        grass_min = float(getattr(pipe.cfg,
+                                  "open_ground_to_grass_min", grass_min))
+        grass_max = float(getattr(pipe.cfg,
+                                  "open_ground_to_grass_max", grass_max))
+    if open_ground_to_grass:
+        open_mask = (seg == ground_id) & (~hard_surface_mask)
+        n_open = int(open_mask.sum())
+        if n_open:
+            lo = max(0.0, min(1.0, grass_min))
+            hi = max(0.0, min(1.0, grass_max))
+            if hi < lo:
+                lo, hi = hi, lo
+            seed_key = f"{tr.plan.name}|open_ground_to_grass"
+            stable_seed = sum((i + 1) * ord(ch)
+                              for i, ch in enumerate(seed_key)) & 0xFFFFFFFF
+            rng = np.random.default_rng(stable_seed)
+            grass_frac = float(rng.uniform(lo, hi))
+
+            def _norm_on_open(x: np.ndarray) -> np.ndarray:
+                vals = x[open_mask]
+                if vals.size == 0:
+                    return np.zeros_like(x, dtype=np.float32)
+                p5, p95 = np.percentile(vals, [5, 95])
+                if p95 <= p5 + 1e-6:
+                    return np.zeros_like(x, dtype=np.float32)
+                y = (x - p5) / (p95 - p5)
+                return np.clip(y, 0.0, 1.0).astype(np.float32)
+
+            rgb_score = np.zeros((size, size), dtype=np.float32)
+            tile_dir_for_rgb = ROOT / oa.CFG["paths"]["tile_root"] / tr.plan.name
+            for rgb_name in ("satellite_image.png", "2_rgb.png"):
+                rgb_path = tile_dir_for_rgb / rgb_name
+                if not rgb_path.exists():
+                    continue
+                try:
+                    rgb_img = Image.open(rgb_path).convert("RGB")
+                    if rgb_img.size != (size, size):
+                        rgb_img = rgb_img.resize((size, size), Image.BILINEAR)
+                    rgb = np.asarray(rgb_img, dtype=np.float32) / 255.0
+                    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+                    exg = 2.0 * g - r - b
+                    green_dom = g - 0.5 * (r + b)
+                    saturation = rgb.max(axis=2) - rgb.min(axis=2)
+                    brightness = rgb.mean(axis=2)
+                    raw = exg + 0.35 * green_dom + 0.15 * saturation
+                    raw *= np.clip((brightness - 0.05) / 0.35, 0.2, 1.0)
+                    from scipy.ndimage import gaussian_filter
+                    rgb_score = gaussian_filter(_norm_on_open(raw), sigma=10.0)
+                    rgb_score = _norm_on_open(rgb_score)
+                    break
+                except Exception as e:  # noqa: BLE001
+                    print(f"[auto] {tr.plan.name} RGB vegetation score failed: {e}")
+
+            try:
+                from scipy.ndimage import gaussian_filter
+                noise = gaussian_filter(rng.random((size, size)), sigma=36.0)
+                noise_score = _norm_on_open(noise)
+            except Exception:
+                noise_score = rng.random((size, size)).astype(np.float32)
+            score = 0.65 * rgb_score + 0.35 * noise_score
+            score[~open_mask] = -1.0
+            k = int(round(n_open * grass_frac))
+            k = max(0, min(n_open, k))
+            grass_mask = np.zeros(open_mask.shape, dtype=bool)
+            if k > 0:
+                open_scores = score[open_mask]
+                thresh = np.partition(open_scores, n_open - k)[n_open - k]
+                grass_mask = open_mask & (score >= thresh)
+                # Exact count in case many pixels tie at the threshold.
+                extra = int(grass_mask.sum()) - k
+                if extra > 0:
+                    tie = np.argwhere(grass_mask & (score == thresh))
+                    if tie.size:
+                        drop = tie[rng.choice(len(tie), min(extra, len(tie)),
+                                              replace=False)]
+                        grass_mask[drop[:, 0], drop[:, 1]] = False
+            n_grass = int(grass_mask.sum())
+            seg[grass_mask] = grass_id
+            base_seg[grass_mask] = grass_id
+            print(f"[auto] {tr.plan.name} open ground->grass: "
+                  f"{n_grass}/{n_open} px ({100.0 * n_grass / n_open:.1f}% "
+                  f"of open ground; target {100.0 * grass_frac:.1f}%; "
+                  "rgb-guided continuous mask)")
 
     # ---- 2. Tree-instance & Building height-level occlusion ---- #
     import geopandas as gpd
@@ -2324,10 +3137,9 @@ def _compose_topview_treeseg_mercator(tr: TileRun, out_png: Path) -> None:
         if tree_mask.shape != (size, size):
             tree_mask = np.zeros((size, size), dtype=bool)
         # This mask comes from the same top-down Blender render family as the
-        # depth map, so it already represents the visible top surface. Trees
-        # should be allowed to cover road/water/grass; building pixels remain
-        # building only where the Blender render did not show tree foliage.
-        is_foliage = tree_mask
+        # depth map, so it already represents the visible top surface. Water and
+        # road are hard exclusions: tree crowns must not relabel them as foliage.
+        is_foliage = tree_mask & (~water_mask) & (~road_mask)
         seg[is_foliage] = foliage_id
         n = int(is_foliage.sum())
         print(f"[auto] {tr.plan.name} composed topview_treeseg "
@@ -2392,9 +3204,10 @@ def _compose_topview_treeseg_mercator(tr: TileRun, out_png: Path) -> None:
         building_id = CLASS_IDS["building"]
 
         # Mask rules:
-        # 1. Trees are above road/water/grass/ground in top view. They only
-        # compete with building footprints, where the taller surface wins.
-        is_foliage = tree_mask & ((~building_mask) | (tree_height_arr >= bld_height_map))
+        # 1. Trees are above grass/ground in top view, but water and road are
+        # hard exclusions. Trees only compete with building footprints, where
+        # the taller surface wins.
+        is_foliage = tree_mask & (~water_mask) & (~road_mask) & ((~building_mask) | (tree_height_arr >= bld_height_map))
         seg[is_foliage] = foliage_id
 
         # 2. Keep the pixel as building if building is taller than tree height
@@ -2953,9 +3766,17 @@ def main():
     ap.add_argument("--city", required=True)
     ap.add_argument("--clean", action="store_true",
                     help="Wipe the output/<city> directory before running to force regeneration of all stages.")
-    ap.add_argument("--bbox", nargs=4, type=float, required=True,
+    ap.add_argument("--bbox", nargs=4, type=float, required=False,
                      metavar=("W", "S", "E", "N"),
-                     help="WGS84 bbox of the area")
+                     help="WGS84 bbox of the area. Required unless --plan is given.")
+    ap.add_argument("--plan", default=None,
+                    help="Path to a saved master tile_plan.json. Uses exact tile bboxes from the plan.")
+    ap.add_argument("--save-plan", default=None,
+                    help="Write the planned master tile_plan.json to this path.")
+    ap.add_argument("--plan-only", action="store_true",
+                    help="Only create/save the master plan; do not generate tiles.")
+    ap.add_argument("--tile-range", default=None,
+                    help="Inclusive tile range to run, e.g. 0001:1000 or 1-1000.")
     ap.add_argument("--overlap", type=float, default=0.0)
     ap.add_argument("--io-workers", type=int, default=8)
     ap.add_argument("--osm-workers", type=int, default=4)
@@ -3000,6 +3821,24 @@ def main():
     ap.add_argument("--target-foliage-ratio", type=float, default=None,
                     help="Target fraction of the tile covered by green canopy (0.001 to 1.0). "
                          "Bumps up the height threshold so only tallest portion of forest is kept (e.g. 0.1).")
+    ap.add_argument("--water-fix-mode",
+                    choices=["off", "tag_only", "geometry_filter", "imagery_filter"],
+                    default=None,
+                    help="Water repair mode: tag_only removes coastline/open waterway polygons; "
+                         "geometry_filter also drops suspicious water polygons; "
+                         "imagery_filter additionally clips water to RGB-supported pixels.")
+    ap.add_argument("--road-width-mode",
+                    choices=["default", "off", "local_lanes"],
+                    default=None,
+                    help="Road width mode. local_lanes derives a city-level highway buffer table from OSM width/lanes tags.")
+    ap.add_argument("--road-width-min-samples", type=int, default=None,
+                    help="minimum OSM width/lanes samples per highway type before using stronger local median blend")
+    ap.add_argument("--road-lane-width-m", type=float, default=None,
+                    help="lane width used for lanes-based local road width estimates")
+    ap.add_argument("--road-lane-margin-m", type=float, default=None,
+                    help="extra full-road margin used with lanes-based estimates")
+    ap.add_argument("--road-width-blend-weight", type=float, default=None,
+                    help="blend weight for local median vs global default road half-width")
     # ----- Vegetation realism knobs (Phase-2 scatter) ----------------- #
     ap.add_argument("--tree-density", type=float, default=None,
                     help="overall tree density (#/m^2)")
@@ -3061,6 +3900,10 @@ def main():
                     help="Z stretch max when GN Z stretch slider = 0")
     ap.add_argument("--gn-z-stretch-max-at-1", type=float, default=None,
                     help="Z stretch max when GN Z stretch slider = 1")
+    ap.add_argument("--open-ground-to-grass-min", type=float, default=None,
+                    help="lower bound for the random fraction of eligible open ground converted to grass")
+    ap.add_argument("--open-ground-to-grass-max", type=float, default=None,
+                    help="upper bound for the random fraction of eligible open ground converted to grass")
     ap.add_argument("--use-blender-seg", dest="use_blender_seg",
                     action="store_true", default=None,
                     help="Use direct Blender-rendered topview for segmentation to guarantee 1-to-1 depth alignment")
@@ -3069,15 +3912,47 @@ def main():
                     help="Do not use direct Blender-rendered topview; use PIL-composed Mercator layout")
     ap.add_argument("--strategy-tag", default=None,
                     help="short label baked into overview PNGs / sidecar")
+    ap.add_argument("--live-log", default=None,
+                    help="Mirror stdout/stderr to this log path. Default: output/<city>/metadata/run_live.log")
+    ap.add_argument("--no-live-log", action="store_true",
+                    help="Disable mirroring stdout/stderr to run_live.log")
+    ap.add_argument("--progress-json", default=None,
+                    help="Write live progress snapshots here. Default: output/<city>/metadata/run_progress_latest.json")
     args = ap.parse_args()
+
+    if args.plan:
+        master_plans = load_master_plan(args.plan)
+        if not master_plans:
+            raise SystemExit(f"--plan has no tiles: {args.plan}")
+        area_bbox = area_bbox_union(master_plans)
+        plan_data = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+        plan_overlap = float(plan_data.get("overlap", args.overlap))
+        plan_gsd = float(plan_data.get("gsd", 0.5))
+        plan_size_px = int(plan_data.get("size_px", 1024))
+    else:
+        if args.bbox is None:
+            raise SystemExit("--bbox is required unless --plan is given")
+        master_plans = None
+        area_bbox = tuple(args.bbox)
+        plan_overlap = float(args.overlap)
+        plan_gsd = 0.5
+        plan_size_px = 1024
+
+    tile_range = parse_tile_range(args.tile_range)
 
     cfg_kwargs = dict(
         city=args.city,
-        area_bbox_wgs=tuple(args.bbox),
-        overlap=float(args.overlap),
+        area_bbox_wgs=tuple(area_bbox),
+        overlap=float(plan_overlap),
+        gsd=float(plan_gsd),
+        size_px=int(plan_size_px),
+        tile_plans=master_plans,
+        tile_range=tile_range,
         io_workers=args.io_workers,
         osm_workers=args.osm_workers,
         canopy_workers=args.canopy_workers,
+        live_log_path=args.live_log,
+        progress_latest_path=args.progress_json,
         cluster_size_min=int(args.cluster_size_min),
         cluster_size_max=int(args.cluster_size_max),
         cluster_disk_radius_min=float(args.cluster_disk_radius_min),
@@ -3117,6 +3992,18 @@ def main():
         cfg_kwargs["cluster_min_size_abs"] = int(args.cluster_min_size_abs)
     if args.target_foliage_ratio is not None:
         cfg_kwargs["target_foliage_ratio"] = float(args.target_foliage_ratio)
+    if args.water_fix_mode is not None:
+        cfg_kwargs["water_fix_mode"] = str(args.water_fix_mode)
+    if args.road_width_mode is not None:
+        cfg_kwargs["road_width_mode"] = str(args.road_width_mode)
+    if args.road_width_min_samples is not None:
+        cfg_kwargs["road_width_min_samples"] = int(args.road_width_min_samples)
+    if args.road_lane_width_m is not None:
+        cfg_kwargs["road_lane_width_m"] = float(args.road_lane_width_m)
+    if args.road_lane_margin_m is not None:
+        cfg_kwargs["road_lane_margin_m"] = float(args.road_lane_margin_m)
+    if args.road_width_blend_weight is not None:
+        cfg_kwargs["road_width_blend_weight"] = float(args.road_width_blend_weight)
     if args.uniform_tree_scale is not None:
         cfg_kwargs["uniform_tree_scale"] = bool(args.uniform_tree_scale)
     if args.topdown_tree_xy_scale is not None:
@@ -3153,6 +4040,10 @@ def main():
         cfg_kwargs["gn_z_stretch_max_at_0"] = float(args.gn_z_stretch_max_at_0)
     if args.gn_z_stretch_max_at_1 is not None:
         cfg_kwargs["gn_z_stretch_max_at_1"] = float(args.gn_z_stretch_max_at_1)
+    if args.open_ground_to_grass_min is not None:
+        cfg_kwargs["open_ground_to_grass_min"] = float(args.open_ground_to_grass_min)
+    if args.open_ground_to_grass_max is not None:
+        cfg_kwargs["open_ground_to_grass_max"] = float(args.open_ground_to_grass_max)
     if args.use_blender_seg is not None:
         cfg_kwargs["use_blender_seg"] = bool(args.use_blender_seg)
 
@@ -3163,20 +4054,53 @@ def main():
             print(f"[auto] --clean specified. Wiping output directory of {args.city} to force clean rebuild: {city_dir}")
             shutil.rmtree(city_dir, ignore_errors=True)
 
+    if args.save_plan or args.plan_only:
+        if master_plans is not None:
+            all_plans = master_plans
+        else:
+            all_plans = plan_tiles(tuple(area_bbox), gsd=float(plan_gsd),
+                                   size_px=int(plan_size_px),
+                                   overlap=float(plan_overlap))
+        out_plan = Path(args.save_plan) if args.save_plan else (
+            ROOT / "output" / args.city / "metadata" / "tile_plan.json")
+        saved = save_master_plan(args.city, tuple(area_bbox), all_plans,
+                                 out_plan, gsd=float(plan_gsd),
+                                 size_px=int(plan_size_px),
+                                 overlap=float(plan_overlap))
+        n_rows, n_cols = grid_shape(all_plans)
+        selected = filter_tile_plans(all_plans, tile_range)
+        print(json.dumps({
+            "city": args.city,
+            "plan_path": str(saved),
+            "n_rows": n_rows,
+            "n_cols": n_cols,
+            "n_tiles": len(all_plans),
+            "selected_tiles": len(selected),
+            "tile_range": args.tile_range,
+            "bbox_union_wgs": list(area_bbox_union(all_plans)),
+        }, indent=2))
+        if args.plan_only:
+            return
+
     cfg = AutoPipelineConfig(**cfg_kwargs)
     # Stash optional strategy tag for the aggregator (not a config field).
     cfg._strategy_tag = args.strategy_tag  # type: ignore[attr-defined]
 
-    def _print_progress(stage, name, status):
-        print(f"  [{stage}] {name:<14s} {status}", flush=True)
+    with _live_log_to_file(args.city, args.live_log,
+                           enabled=not args.no_live_log) as live_log_path:
+        def _print_progress(stage, name, status):
+            print(f"  [{stage}] {name:<14s} {status}", flush=True)
 
-    pipe = AutoPipeline(cfg, progress_cb=_print_progress)
-    runs = pipe.plan()
-    n_rows, n_cols = grid_shape([tr.plan for tr in runs])
-    print(f"[auto] city={args.city}  grid={n_rows}x{n_cols}={len(runs)} tiles",
-          flush=True)
-    summary = pipe.run()
-    print(json.dumps(summary, indent=2))
+        pipe = AutoPipeline(cfg, progress_cb=_print_progress)
+        runs = pipe.plan()
+        n_rows, n_cols = grid_shape([tr.plan for tr in runs])
+        print(f"[auto] city={args.city}  "
+              f"grid={n_rows}x{n_cols}={len(runs)} tiles", flush=True)
+        print(f"[auto] live log: {pipe.live_log_path}", flush=True)
+        print(f"[auto] progress json: {pipe.progress_latest_path}",
+              flush=True)
+        summary = pipe.run()
+        print(json.dumps(summary, indent=2))
 
 
 # --------------------------------------------------------------------- #

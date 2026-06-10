@@ -77,6 +77,34 @@ python auto_pipeline.py \
   --clean
 ```
 
+
+City-scale master plan workflow:
+
+```bash
+# 1) Save a stable grid plan without generating tiles.
+python auto_pipeline.py \
+  --city omaha_full \
+  --bbox -96.40 41.05 -95.85 41.45 \
+  --plan-only
+
+# 2) Generate the city in batches from that fixed plan.
+python auto_pipeline.py \
+  --city omaha_full \
+  --plan output/omaha_full/metadata/tile_plan.json \
+  --tile-range 0001:1000
+
+python auto_pipeline.py \
+  --city omaha_full \
+  --plan output/omaha_full/metadata/tile_plan.json \
+  --tile-range 1001:2000
+```
+
+In `osm_app.py`, use Tab 2 to search a city, inspect the Esri satellite
+overview, click NW and SE corners, then click **Save Master Plan**. The saved
+plan can be used by the **Generate Tile Range from Plan** button or the CLI
+commands above. Keep the same plan file for every batch to avoid overlap or
+coordinate drift.
+
 ## WebUI
 
 ```bash

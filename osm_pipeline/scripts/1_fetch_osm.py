@@ -43,8 +43,9 @@ from dataprep.geometry_utils import (  # noqa: E402
 # community-maintained and usually faster. See
 # https://wiki.openstreetmap.org/wiki/Overpass_API#Public_Overpass_API_instances
 OVERPASS_ENDPOINTS = [
-    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.fr/api/interpreter",
     "https://overpass.osm.ch/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
     "https://overpass-api.de/api/interpreter",
 ]
 _OSMNX_CONFIGURED = False

@@ -44,8 +44,9 @@ from .osm_tags import ROAD_HIGHWAY_KEEP
 
 
 OVERPASS_ENDPOINTS = (
-    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.fr/api/interpreter",
     "https://overpass.osm.ch/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
     "https://overpass-api.de/api/interpreter",
 )
 
@@ -81,10 +82,12 @@ def _bucket(tags: dict) -> str | None:
     way_w = tags.get("waterway")
     lu = tags.get("landuse")
     leis = tags.get("leisure")
-    if nat in {"water", "bay", "strait", "coastline"}:
+    if nat in {"water", "bay", "strait"}:
         return "water"
-    if way_w in {"river", "stream", "canal", "riverbank"}:
+    if way_w == "riverbank":
         return "water"
+    if way_w in {"river", "stream", "canal"}:
+        return "_water_line"
     if lu in {"reservoir", "basin"}:
         return "water"
     if lu in {"grass", "meadow", "recreation_ground", "village_green",
@@ -122,7 +125,7 @@ def _build_query(bbox) -> str:
 (
   way["building"]({bb});
   way["highway"]({bb});
-  way["natural"~"^(water|bay|coastline|grassland|heath|wood|scrub|tree_row)$"]({bb});
+  way["natural"~"^(water|bay|grassland|heath|wood|scrub|tree_row)$"]({bb});
   way["waterway"~"^(river|stream|canal|riverbank)$"]({bb});
   way["landuse"~"^(grass|meadow|recreation_ground|village_green|cemetery|allotments|reservoir|basin|forest|orchard)$"]({bb});
   way["leisure"~"^(park|garden|pitch|playground|golf_course|nature_reserve)$"]({bb});
@@ -188,13 +191,26 @@ def _post_with_failover(query: str, endpoints, timeout: int = 60) -> dict:
         f"all overpass endpoints failed; last error: {last}")
 
 
-def _way_to_polygon(geom_pts: list[dict]) -> Polygon | None:
-    """Overpass ``geometry`` is a list of {lat, lon} dicts. Closed
-    ways become Polygons; we silently drop ways with <4 points."""
+def _way_is_closed(geom_pts: list[dict]) -> bool:
+    if not geom_pts or len(geom_pts) < 4:
+        return False
+    return (geom_pts[0].get("lon") == geom_pts[-1].get("lon")
+            and geom_pts[0].get("lat") == geom_pts[-1].get("lat"))
+
+
+def _way_to_polygon(geom_pts: list[dict], *, force_close: bool = True) -> Polygon | None:
+    """Overpass ``geometry`` is a list of {lat, lon} dicts.
+
+    Closed ways become Polygons. Open ways are only force-closed when the
+    caller explicitly allows it; linear water features must not be converted
+    into large artificial polygons.
+    """
     if not geom_pts or len(geom_pts) < 4:
         return None
     coords = [(p["lon"], p["lat"]) for p in geom_pts]
     if coords[0] != coords[-1]:
+        if not force_close:
+            return None
         coords.append(coords[0])
     try:
         p = Polygon(coords)
@@ -222,7 +238,7 @@ def fetch_all_classes_combined(
 
     Returns dict with keys:
         building, water, grass, foliage : shapely (Multi)Polygon | None
-        _road_edges : GeoDataFrame[geometry=LineString, highway, lanes,
+        _road_edges : GeoDataFrame[geometry=LineString, highway, width, lanes,
                                    maxspeed, oneway, name] in EPSG:4326
         _meta : {"endpoint": ..., "elapsed_s": ..., "n_elements": ...}
     """
@@ -251,6 +267,11 @@ def fetch_all_classes_combined(
         kind = _bucket(tags)
         if kind is None:
             continue
+        if kind == "_water_line":
+            # River/stream/canal ways are usually centre-lines. Do not close
+            # them into polygons; a future line-buffer pass can add narrow
+            # waterways if needed.
+            continue
         if kind == "_highway":
             hw = tags.get("highway")
             if hw not in keep:
@@ -262,6 +283,7 @@ def fetch_all_classes_combined(
                 "geometry": ls,
                 "highway": hw,
                 "name": tags.get("name"),
+                "width": tags.get("width"),
                 "lanes": tags.get("lanes"),
                 "maxspeed": tags.get("maxspeed"),
                 "oneway": tags.get("oneway"),
@@ -269,7 +291,9 @@ def fetch_all_classes_combined(
             continue
         # Polygonal classes: ways become Polygons.
         if el.get("type") == "way":
-            p = _way_to_polygon(el.get("geometry", []))
+            geom_pts = el.get("geometry", [])
+            force_close = kind != "water"
+            p = _way_to_polygon(geom_pts, force_close=force_close)
             if p is not None and not p.is_empty:
                 polys[kind].append(p)
                 if kind == "building":
@@ -315,7 +339,7 @@ def fetch_all_classes_combined(
     else:
         edges = gpd.GeoDataFrame(
             {"geometry": [], "highway": [], "name": [],
-             "lanes": [], "maxspeed": [], "oneway": []},
+             "width": [], "lanes": [], "maxspeed": [], "oneway": []},
             crs="EPSG:4326")
     out["_road_edges"] = edges
     # Per-building GeoDataFrame (one row per OSM building way) so KR2 +
