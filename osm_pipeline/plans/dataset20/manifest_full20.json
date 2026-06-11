@@ -1,6 +1,6 @@
 {
-  "name": "dataset20_near_nadir1_seed64",
-  "description": "20-city OSM + generation run split across H200 and H100 servers.",
+  "name": "dataset20_full20_near_nadir1_seed64",
+  "description": "Full 20-city OSM + generation + HF upload run for JasonXF/SynthUrbanSAT-20k. All cities are regenerated with the same plan structure.",
   "created": "2026-06-11",
   "global": {
     "seed": 64,
@@ -8,14 +8,15 @@
     "depth_format": "png",
     "generation_seed_chunk_size": 1,
     "generation_skip_existing": true,
-    "osm_strategy_tag": "dataset20-s64-nn1",
+    "osm_strategy_tag": "dataset20-s64-nn1-full20",
     "osm_workers": {
       "io_workers": 8,
       "osm_workers": 4,
       "canopy_workers": 4
     },
-    "hf_repo": "JasonXF/SynthUrbanSAT-5k",
-    "hf_path_prefix": ""
+    "hf_repo": "JasonXF/SynthUrbanSAT-20k",
+    "hf_path_prefix": "",
+    "completion_definition": "city is complete only after OSM, generation, and HF upload stages all finish successfully"
   },
   "machines": {
     "h200": {

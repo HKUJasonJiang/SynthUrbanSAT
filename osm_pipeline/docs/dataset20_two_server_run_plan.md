@@ -1,6 +1,13 @@
 # Dataset20 Two-Server Run Plan
 
-This plan prepares the 20-city OSM dataset run for two external servers. The source tile plans are copied under `osm_pipeline/plans/dataset20/`, so the servers only need to pull the repository and run the launcher.
+This plan prepares the full 20-city OSM dataset run for two external servers. The source tile plans are versioned under `osm_pipeline/plans/dataset20/`, so each server only needs to pull the repository and run the launcher.
+
+The previous `JasonXF/SynthUrbanSAT-5k` upload used the older direct city-root layout, e.g. `<city>/config`, `<city>/metadata`, `<city>/tile_0001`. For the new full run we use a clean repo, `JasonXF/SynthUrbanSAT-20k`, and a consistent three-part layout per city:
+
+```text
+<city>/osm/                              # OSM pipeline output
+<city>/generation/near-nadir-1_seed64/   # generated pseudo-RGB output
+```
 
 ## Global Settings
 
@@ -14,34 +21,20 @@ This plan prepares the 20-city OSM dataset run for two external servers. The sou
 | OOM guard | `--seed-chunk-size 1` |
 | OSM plan source | `osm_pipeline/plans/dataset20/<city>/tile_plan.json` |
 | OSM output | `osm_pipeline/output/<city>/` |
-| Default manifest | `osm_pipeline/plans/dataset20/manifest.json` now points to the remaining 16 cities |
+| Default manifest | `osm_pipeline/plans/dataset20/manifest.json` points to the full 20-city run |
 | Generation output | `generation_pipeline/output/osm_batch__<city>__near-nadir-1__depth-png__<ckpt>/` |
-| HF repo | `JasonXF/SynthUrbanSAT-5k` by default, override with `--hf-repo` |
+| HF repo | `JasonXF/SynthUrbanSAT-20k` by default, override with `--hf-repo` |
 | HF layout | `<city>/osm/` and `<city>/generation/near-nadir-1_seed64/` |
 
-## Completed / Deprecated Cities
+## Server Split
 
-These 4 cities are already generated/uploaded and are excluded from the default remaining manifest. The old Tampa upload is marked as deprecated, but the new `tampa-1638` plan remains in the remaining run.
-
-| city | status |
-|---|---|
-| `des-moines-450` | completed |
-| `jacksonville-1980` | completed |
-| `omaha-984` | completed |
-| `wichita-300` | completed |
-| `tampa-1080` | old external run; mark/delete externally, not used as final Tampa |
-
-The original 20-city manifest is preserved at `osm_pipeline/plans/dataset20/manifest_full20.json`. The default `manifest.json` now contains the remaining 16 final cities, including the new `tampa-1638`.
-
-## Remaining Server Split
-
-The remaining split keeps both machines almost exactly balanced.
+The split keeps exactly 10 cities per machine and gives the H200 a slightly heavier shard.
 
 | server | cities | tiles |
 |---|---|---:|
-| H200 | houston-2632, tampa-1638, chicago-1395, austin-784, lincoln-513, topeka-480, tallahassee-409, washington-dc-352 | 8,200 |
-| H100 | new-york-city-2738, philadelphia-1722, oklahoma-city-1316, little-rock-1140, columbia-sc-450, vienna-391, potsdam-336, vaihingen-90 | 8,183 |
-| total remaining | 16 cities | 16,383 |
+| H200 | new-york-city-2738, houston-2632, philadelphia-1722, omaha-984, lincoln-513, topeka-480, columbia-sc-450, vienna-391, wichita-300, vaihingen-90 | 10,300 |
+| H100 | jacksonville-1980, tampa-1638, chicago-1395, oklahoma-city-1316, little-rock-1140, austin-784, des-moines-450, tallahassee-409, washington-dc-352, potsdam-336 | 9,797 |
+| total | 20 cities | 20,097 |
 
 ## Completion Definition
 
@@ -91,13 +84,13 @@ export HF_TOKEN_WRITE=hf_xxx
 python osm_pipeline/scripts/run_osm_generation_batch.py \
   --machine h200 \
   --stage upload \
-  --hf-repo JasonXF/SynthUrbanSAT-5k \
+  --hf-repo JasonXF/SynthUrbanSAT-20k \
   --continue-on-error
 
 python osm_pipeline/scripts/run_osm_generation_batch.py \
   --machine h100 \
   --stage upload \
-  --hf-repo JasonXF/SynthUrbanSAT-5k \
+  --hf-repo JasonXF/SynthUrbanSAT-20k \
   --continue-on-error
 ```
 
@@ -129,7 +122,7 @@ The launcher dry run validates that all plan files exist and prints the exact OS
 - `--skip-existing` means generation can be restarted safely after interruption.
 - `--seed-chunk-size 1` keeps peak VRAM lower. Since this plan uses only seed `64`, it also gives the cleanest resume behavior.
 - Avoid compare mode for the full run. Compare mode loads baselines and is for small paper figures, not dataset generation.
-- If a city fails, rerun with `--only-city <city> --stage <osm|generation>` after checking the corresponding log.
+- If a city fails, rerun with `--only-city <city> --stage <osm|generation|upload>` after checking the corresponding log.
 
 ## Recommended Planning
 
