@@ -1,0 +1,134 @@
+{
+  "name": "dataset20_near_nadir1_seed64",
+  "description": "20-city OSM + generation run split across H200 and H100 servers.",
+  "created": "2026-06-11",
+  "global": {
+    "seed": 64,
+    "near_nadir": 1,
+    "depth_format": "png",
+    "generation_seed_chunk_size": 1,
+    "generation_skip_existing": true,
+    "osm_strategy_tag": "dataset20-s64-nn1",
+    "osm_workers": {
+      "io_workers": 8,
+      "osm_workers": 4,
+      "canopy_workers": 4
+    },
+    "hf_repo": "JasonXF/SynthUrbanSAT-5k",
+    "hf_path_prefix": ""
+  },
+  "machines": {
+    "h200": {
+      "recommended_role": "slightly heavier shard",
+      "tile_total": 10300,
+      "cities": [
+        {
+          "city": "new-york-city-2738",
+          "tiles": 2738,
+          "plan": "osm_pipeline/plans/dataset20/new-york-city-2738/tile_plan.json"
+        },
+        {
+          "city": "houston-2632",
+          "tiles": 2632,
+          "plan": "osm_pipeline/plans/dataset20/houston-2632/tile_plan.json"
+        },
+        {
+          "city": "philadelphia-1722",
+          "tiles": 1722,
+          "plan": "osm_pipeline/plans/dataset20/philadelphia-1722/tile_plan.json"
+        },
+        {
+          "city": "omaha-984",
+          "tiles": 984,
+          "plan": "osm_pipeline/plans/dataset20/omaha-984/tile_plan.json"
+        },
+        {
+          "city": "lincoln-513",
+          "tiles": 513,
+          "plan": "osm_pipeline/plans/dataset20/lincoln-513/tile_plan.json"
+        },
+        {
+          "city": "topeka-480",
+          "tiles": 480,
+          "plan": "osm_pipeline/plans/dataset20/topeka-480/tile_plan.json"
+        },
+        {
+          "city": "columbia-sc-450",
+          "tiles": 450,
+          "plan": "osm_pipeline/plans/dataset20/columbia-sc-450/tile_plan.json"
+        },
+        {
+          "city": "vienna-391",
+          "tiles": 391,
+          "plan": "osm_pipeline/plans/dataset20/vienna-391/tile_plan.json"
+        },
+        {
+          "city": "wichita-300",
+          "tiles": 300,
+          "plan": "osm_pipeline/plans/dataset20/wichita-300/tile_plan.json"
+        },
+        {
+          "city": "vaihingen-90",
+          "tiles": 90,
+          "plan": "osm_pipeline/plans/dataset20/vaihingen-90/tile_plan.json"
+        }
+      ]
+    },
+    "h100": {
+      "recommended_role": "slightly lighter shard",
+      "tile_total": 9797,
+      "cities": [
+        {
+          "city": "jacksonville-1980",
+          "tiles": 1980,
+          "plan": "osm_pipeline/plans/dataset20/jacksonville-1980/tile_plan.json"
+        },
+        {
+          "city": "tampa-1638",
+          "tiles": 1638,
+          "plan": "osm_pipeline/plans/dataset20/tampa-1638/tile_plan.json"
+        },
+        {
+          "city": "chicago-1395",
+          "tiles": 1395,
+          "plan": "osm_pipeline/plans/dataset20/chicago-1395/tile_plan.json"
+        },
+        {
+          "city": "oklahoma-city-1316",
+          "tiles": 1316,
+          "plan": "osm_pipeline/plans/dataset20/oklahoma-city-1316/tile_plan.json"
+        },
+        {
+          "city": "little-rock-1140",
+          "tiles": 1140,
+          "plan": "osm_pipeline/plans/dataset20/little-rock-1140/tile_plan.json"
+        },
+        {
+          "city": "austin-784",
+          "tiles": 784,
+          "plan": "osm_pipeline/plans/dataset20/austin-784/tile_plan.json"
+        },
+        {
+          "city": "des-moines-450",
+          "tiles": 450,
+          "plan": "osm_pipeline/plans/dataset20/des-moines-450/tile_plan.json"
+        },
+        {
+          "city": "tallahassee-409",
+          "tiles": 406,
+          "plan": "osm_pipeline/plans/dataset20/tallahassee-409/tile_plan.json"
+        },
+        {
+          "city": "washington-dc-352",
+          "tiles": 352,
+          "plan": "osm_pipeline/plans/dataset20/washington-dc-352/tile_plan.json"
+        },
+        {
+          "city": "potsdam-336",
+          "tiles": 336,
+          "plan": "osm_pipeline/plans/dataset20/potsdam-336/tile_plan.json"
+        }
+      ]
+    }
+  }
+}

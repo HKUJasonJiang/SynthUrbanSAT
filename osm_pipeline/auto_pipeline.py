@@ -3792,6 +3792,12 @@ def main():
                     help="max cluster disk radius (m)")
     ap.add_argument("--cluster-disk-aspect", type=float, default=0.65,
                     help="ellipse aspect ratio (1=circle)")
+    ap.add_argument("--height-seed", type=int, default=None,
+                    help="Seed for sampled missing building heights. Default: AutoPipelineConfig.height_seed.")
+    ap.add_argument("--scatter-seed", type=int, default=None,
+                    help="Seed for Blender/GN tree scattering. Default: AutoPipelineConfig.scatter_seed.")
+    ap.add_argument("--tree-height-seed", type=int, default=None,
+                    help="Seed for legacy tree-height sampling path. Default: AutoPipelineConfig.tree_h_seed.")
     ap.add_argument("--cluster-size-dist", default=None,
                     choices=["uniform", "bimodal", "beta_u"],
                     help="cluster-size shape (default uniform). bimodal"
@@ -3959,6 +3965,12 @@ def main():
         cluster_disk_radius_max=float(args.cluster_disk_radius_max),
         cluster_disk_aspect=float(args.cluster_disk_aspect),
     )
+    if args.height_seed is not None:
+        cfg_kwargs["height_seed"] = int(args.height_seed)
+    if args.scatter_seed is not None:
+        cfg_kwargs["scatter_seed"] = int(args.scatter_seed)
+    if args.tree_height_seed is not None:
+        cfg_kwargs["tree_h_seed"] = int(args.tree_height_seed)
     if args.tree_density is not None:
         cfg_kwargs["tree_density"] = float(args.tree_density)
     if args.scatter_mode is not None:
